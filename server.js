@@ -10,6 +10,7 @@ const SHOPIFY_API_KEY = process.env.SHOPIFY_API_KEY;
 const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
 const SCOPES = "read_products,read_orders";
 const HOST = process.env.HOST; // e.g. https://your-app.up.railway.app
+const APP_HANDLE = process.env.APP_HANDLE || "mr-bean";
 
 if (!SHOPIFY_API_KEY || !SHOPIFY_API_SECRET) {
   console.error("Missing SHOPIFY_API_KEY or SHOPIFY_API_SECRET env vars");
@@ -299,9 +300,11 @@ app.get("/auth/callback", async (req, res) => {
     req.session.shop = shop;
     req.session.accessToken = access_token;
 
-    // Pass host param through so App Bridge can initialize in the embedded iframe
-    const host = req.query.host;
-    res.redirect(host ? `/dashboard?host=${encodeURIComponent(host)}` : "/dashboard");
+    // Redirect into Shopify admin so the app loads embedded
+    const storeSlug = shop.replace(".myshopify.com", "");
+    const adminUrl = `https://admin.shopify.com/store/${storeSlug}/apps/${APP_HANDLE}`;
+    console.log("[callback] redirecting to:", adminUrl);
+    res.redirect(adminUrl);
   } catch (err) {
     console.error("OAuth callback error:", err);
     res.status(500).send("Authentication failed. Check server logs.");
