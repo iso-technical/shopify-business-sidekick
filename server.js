@@ -67,11 +67,28 @@ async function shopifyFetch(shop, accessToken, endpoint) {
 
 // --- Routes ---
 
-// Home — start install flow
+// Home — handle Shopify admin launch or manual install
 app.get("/", (req, res) => {
+  const shop = req.query.shop;
+
+  // If already authenticated, go straight to dashboard
   if (req.session.shop && req.session.accessToken) {
+    // If Shopify sent a different shop param, re-auth for that shop
+    if (shop && shop !== req.session.shop) {
+      req.session.destroy(() => {
+        res.redirect(`/auth?shop=${encodeURIComponent(shop)}`);
+      });
+      return;
+    }
     return res.redirect("/dashboard");
   }
+
+  // Shopify admin sends ?shop=store.myshopify.com — auto-redirect to OAuth
+  if (shop && shop.match(/^[a-zA-Z0-9-]+\.myshopify\.com$/)) {
+    return res.redirect(`/auth?shop=${encodeURIComponent(shop)}`);
+  }
+
+  // No shop param and no session — show manual install form
   res.send(`
     <!DOCTYPE html>
     <html lang="en">
