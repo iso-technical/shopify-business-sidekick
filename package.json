@@ -1,0 +1,18 @@
+{
+  "name": "shopify-dashboard-app",
+  "version": "1.0.0",
+  "description": "Shopify app with OAuth authentication and basic store dashboard",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "express-session": "^1.18.0",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
