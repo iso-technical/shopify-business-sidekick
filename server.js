@@ -228,21 +228,30 @@ app.get("/auth/callback", async (req, res) => {
 
   try {
     // Exchange code for permanent access token
-    const tokenRes = await fetch(`https://${shop}/admin/oauth/access_token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        client_id: SHOPIFY_API_KEY,
-        client_secret: SHOPIFY_API_SECRET,
-        code,
-      }),
+    // Shopify's OAuth token endpoint expects form-encoded data, not JSON
+    const tokenBody = new URLSearchParams({
+      client_id: SHOPIFY_API_KEY,
+      client_secret: SHOPIFY_API_SECRET,
+      code,
     });
 
+    console.log("[token] POST https://%s/admin/oauth/access_token", shop);
+
+    const tokenRes = await fetch(`https://${shop}/admin/oauth/access_token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: tokenBody.toString(),
+    });
+
+    const tokenText = await tokenRes.text();
+    console.log("[token] status:", tokenRes.status);
+    console.log("[token] response:", tokenText.substring(0, 200));
+
     if (!tokenRes.ok) {
-      throw new Error(`Token exchange failed: ${await tokenRes.text()}`);
+      throw new Error(`Token exchange failed (${tokenRes.status}): ${tokenText.substring(0, 200)}`);
     }
 
-    const { access_token } = await tokenRes.json();
+    const { access_token } = JSON.parse(tokenText);
 
     req.session.shop = shop;
     req.session.accessToken = access_token;
