@@ -30,6 +30,21 @@ app.use(
 
 app.use(express.json());
 
+// Allow Shopify admin to frame this app
+app.use((req, res, next) => {
+  const shop = req.query.shop || req.session?.shop;
+  if (shop) {
+    res.setHeader(
+      "Content-Security-Policy",
+      `frame-ancestors https://${shop} https://admin.shopify.com; ` +
+      `script-src 'self' 'unsafe-inline' https://cdn.shopify.com`
+    );
+  } else {
+    res.setHeader("Content-Security-Policy", "frame-ancestors 'none'");
+  }
+  next();
+});
+
 // --- Helpers ---
 
 function buildRedirectUri() {
@@ -187,7 +202,9 @@ app.get("/auth/callback", async (req, res) => {
     req.session.shop = shop;
     req.session.accessToken = access_token;
 
-    res.redirect("/dashboard");
+    // Pass host param through so App Bridge can initialize in the embedded iframe
+    const host = req.query.host;
+    res.redirect(host ? `/dashboard?host=${encodeURIComponent(host)}` : "/dashboard");
   } catch (err) {
     console.error("OAuth callback error:", err);
     res.status(500).send("Authentication failed. Check server logs.");
@@ -274,6 +291,7 @@ function buildDashboardHtml(storeName, shop, products, orders) {
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <title>Dashboard — ${escapeHtml(storeName)}</title>
+      <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
       <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f6f6f7; color: #1a1a1a; }
@@ -293,6 +311,12 @@ function buildDashboardHtml(storeName, shop, products, orders) {
       </style>
     </head>
     <body>
+      <script>
+        shopify.config = {
+          apiKey: ${JSON.stringify(SHOPIFY_API_KEY)},
+          host: new URLSearchParams(window.location.search).get("host") || btoa("${escapeHtml(shop)}/admin"),
+        };
+      </script>
       <div class="topbar">
         <h1>Shopify Dashboard</h1>
         <a href="/disconnect">Disconnect</a>
