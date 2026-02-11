@@ -71,7 +71,19 @@ function verifyHmac(query) {
     .createHmac("sha256", SHOPIFY_API_SECRET)
     .update(sorted)
     .digest("hex");
-  return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(hmac));
+
+  console.log("[HMAC] message string:", sorted);
+  console.log("[HMAC] received:", hmac);
+  console.log("[HMAC] computed:", computed);
+
+  if (Buffer.from(computed).length !== Buffer.from(hmac).length) {
+    console.log("[HMAC] length mismatch — received:", hmac.length, "computed:", computed.length);
+    return false;
+  }
+
+  const match = crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(hmac));
+  console.log("[HMAC] match:", match);
+  return match;
 }
 
 async function shopifyFetch(shop, accessToken, endpoint) {
@@ -194,15 +206,25 @@ app.get("/auth", (req, res) => {
 app.get("/auth/callback", async (req, res) => {
   const { shop, code, state, hmac } = req.query;
 
+  console.log("[callback] shop:", shop);
+  console.log("[callback] state from query:", state);
+  console.log("[callback] nonce from session:", req.session.nonce);
+  console.log("[callback] session ID:", req.sessionID);
+  console.log("[callback] hmac present:", !!hmac);
+
   // Verify state/nonce
   if (state !== req.session.nonce) {
+    console.log("[callback] STATE MISMATCH — query state:", JSON.stringify(state), "session nonce:", JSON.stringify(req.session.nonce));
     return res.status(403).send("State mismatch — possible CSRF attack.");
   }
 
   // Verify HMAC
   if (!hmac || !verifyHmac(req.query)) {
+    console.log("[callback] HMAC FAILED");
     return res.status(403).send("HMAC validation failed.");
   }
+
+  console.log("[callback] validation passed, exchanging token...");
 
   try {
     // Exchange code for permanent access token
