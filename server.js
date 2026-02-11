@@ -154,27 +154,9 @@ app.get("/auth", (req, res) => {
     `&redirect_uri=${encodeURIComponent(redirectUri)}` +
     `&state=${nonce}`;
 
-  // Embedded apps run in an iframe — use App Bridge to redirect top-level window
-  if (req.query.embedded || req.headers["sec-fetch-dest"] === "iframe") {
-    const host = req.query.host || "";
-    return res.send(`
-      <!DOCTYPE html>
-      <html><head>
-        <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
-        <script>
-          // Initialize App Bridge v4 before redirecting
-          shopify.config = {
-            apiKey: ${JSON.stringify(SHOPIFY_API_KEY)},
-            host: ${JSON.stringify(host)} || btoa(${JSON.stringify(shop)} + "/admin"),
-          };
-
-          // App Bridge v4 uses open() with _top to navigate out of the iframe
-          open(${JSON.stringify(installUrl)}, "_top");
-        </script>
-      </head><body>Redirecting to Shopify...</body></html>
-    `);
-  }
-
+  // X-Frame-Options: DENY forces the browser to break out of the iframe
+  // when it receives the 302 redirect to Shopify's OAuth page
+  res.setHeader("X-Frame-Options", "DENY");
   res.redirect(installUrl);
 });
 
