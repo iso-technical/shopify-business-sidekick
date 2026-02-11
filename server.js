@@ -2,7 +2,6 @@ require("dotenv").config();
 const express = require("express");
 const crypto = require("crypto");
 const session = require("express-session");
-const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -22,7 +21,10 @@ app.use(
     secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString("hex"),
     resave: false,
     saveUninitialized: false,
-    cookie: { secure: process.env.NODE_ENV === "production" },
+    cookie: {
+      secure: process.env.NODE_ENV === "production",
+      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+    },
   })
 );
 
@@ -127,6 +129,7 @@ app.get("/auth", (req, res) => {
 
   const nonce = generateNonce();
   req.session.nonce = nonce;
+  req.session.pendingShop = shop;
 
   const redirectUri = buildRedirectUri();
   const installUrl =
@@ -135,6 +138,16 @@ app.get("/auth", (req, res) => {
     `&scope=${SCOPES}` +
     `&redirect_uri=${encodeURIComponent(redirectUri)}` +
     `&state=${nonce}`;
+
+  // Embedded apps run in an iframe — must break out to top-level for OAuth
+  if (req.query.embedded || req.headers["sec-fetch-dest"] === "iframe") {
+    return res.send(`
+      <!DOCTYPE html>
+      <html><head>
+        <script>window.top.location.href = ${JSON.stringify(installUrl)};</script>
+      </head><body>Redirecting to Shopify...</body></html>
+    `);
+  }
 
   res.redirect(installUrl);
 });
@@ -183,8 +196,13 @@ app.get("/auth/callback", async (req, res) => {
 
 // Dashboard — show store info, products, orders
 app.get("/dashboard", async (req, res) => {
-  const { shop, accessToken } = req.session;
+  const { shop, accessToken, pendingShop } = req.session;
   if (!shop || !accessToken) {
+    // Preserve shop context so "/" can auto-redirect to OAuth
+    const knownShop = req.query.shop || pendingShop;
+    if (knownShop) {
+      return res.redirect(`/?shop=${encodeURIComponent(knownShop)}`);
+    }
     return res.redirect("/");
   }
 
