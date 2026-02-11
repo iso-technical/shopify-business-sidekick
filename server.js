@@ -128,13 +128,46 @@ app.get("/", (req, res) => {
     return res.redirect("/dashboard");
   }
 
-  // Shopify admin sends ?shop=store.myshopify.com — redirect to /install
-  // so OAuth completes in a normal browser tab, not inside the iframe
+  // Shopify admin loads /?shop=store.myshopify.com in an iframe
+  // Can't redirect — show a click-through that opens /install in top window
   if (shop && shop.match(/^[a-zA-Z0-9-]+\.myshopify\.com$/)) {
-    return res.redirect(`/install?shop=${encodeURIComponent(shop)}`);
+    const installUrl = `${HOST}/install?shop=${encodeURIComponent(shop)}`;
+    return res.send(`
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Authorize — Shopify Dashboard App</title>
+        <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
+        <script>
+          shopify.config = {
+            apiKey: ${JSON.stringify(SHOPIFY_API_KEY)},
+            host: new URLSearchParams(window.location.search).get("host")
+              || btoa(${JSON.stringify(shop + "/admin")}),
+          };
+        </script>
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f6f6f7; }
+          .card { background: #fff; border-radius: 12px; padding: 48px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); text-align: center; max-width: 440px; }
+          h1 { margin: 0 0 8px; font-size: 22px; color: #1a1a1a; }
+          p { color: #6b7177; margin: 0 0 24px; font-size: 15px; line-height: 1.5; }
+          a.btn { display: inline-block; padding: 12px 28px; background: #008060; color: #fff; text-decoration: none; border-radius: 8px; font-size: 15px; font-weight: 500; }
+          a.btn:hover { background: #006e52; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h1>Please authorize this app</h1>
+          <p>Click below to connect your store. A new window will open to complete authorization.</p>
+          <a class="btn" href="${escapeHtml(installUrl)}" target="_top">Authorize App</a>
+        </div>
+      </body>
+      </html>
+    `);
   }
 
-  // No shop param and no session — send to install page
+  // No shop param and no session — redirect to install page
   res.redirect("/install");
 });
 
