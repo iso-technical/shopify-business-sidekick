@@ -88,16 +88,25 @@ function verifyHmac(query) {
 
 async function shopifyFetch(shop, accessToken, endpoint) {
   const url = `https://${shop}/admin/api/2024-01/${endpoint}.json`;
-  const res = await fetch(url, {
-    headers: {
-      "X-Shopify-Access-Token": accessToken,
-      "Content-Type": "application/json",
-    },
-  });
+  const headers = {
+    "X-Shopify-Access-Token": accessToken,
+    "Content-Type": "application/json",
+  };
+
+  console.log("[api] GET", url);
+  console.log("[api] token:", accessToken ? accessToken.substring(0, 6) + "..." : "MISSING");
+
+  const res = await fetch(url, { headers });
+  const body = await res.text();
+
+  console.log("[api] %s → %d (%d bytes)", endpoint, res.status, body.length);
+
   if (!res.ok) {
-    throw new Error(`Shopify API error ${res.status}: ${await res.text()}`);
+    console.log("[api] error body:", body.substring(0, 200));
+    throw new Error(`Shopify API error ${res.status}: ${body.substring(0, 200)}`);
   }
-  return res.json();
+
+  return JSON.parse(body);
 }
 
 // --- Routes ---
@@ -278,11 +287,13 @@ app.get("/dashboard", async (req, res) => {
   }
 
   try {
+    console.log("[dashboard] fetching data for shop:", shop);
     const [shopData, productsData, ordersData] = await Promise.all([
       shopifyFetch(shop, accessToken, "shop"),
       shopifyFetch(shop, accessToken, "products?limit=5"),
       shopifyFetch(shop, accessToken, "orders?limit=5&status=any"),
     ]);
+    console.log("[dashboard] all 3 API calls succeeded");
 
     const storeName = shopData.shop.name;
     const products = productsData.products || [];
