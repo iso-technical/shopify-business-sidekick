@@ -87,7 +87,8 @@ function verifyHmac(query) {
 }
 
 async function shopifyFetch(shop, accessToken, endpoint) {
-  const url = `https://${shop}/admin/api/2024-01/${endpoint}.json`;
+  const [path, query] = endpoint.split("?");
+  const url = `https://${shop}/admin/api/2024-01/${path}.json${query ? "?" + query : ""}`;
   const headers = {
     "X-Shopify-Access-Token": accessToken,
     "Content-Type": "application/json",
