@@ -97,16 +97,16 @@ async function shopifyFetch(shop, accessToken, endpoint) {
   console.log("[api] token:", accessToken ? accessToken.substring(0, 6) + "..." : "MISSING");
 
   const res = await fetch(url, { headers });
-  const body = await res.text();
 
-  console.log("[api] %s → %d (%d bytes)", endpoint, res.status, body.length);
+  console.log("[api] %s → %d", endpoint, res.status);
 
   if (!res.ok) {
-    console.log("[api] error body:", body.substring(0, 200));
-    throw new Error(`Shopify API error ${res.status}: ${body.substring(0, 200)}`);
+    const errBody = await res.text();
+    console.log("[api] error body:", errBody.substring(0, 200));
+    throw new Error(`Shopify API error ${res.status}: ${errBody.substring(0, 200)}`);
   }
 
-  return JSON.parse(body);
+  return res.json();
 }
 
 // --- Routes ---
