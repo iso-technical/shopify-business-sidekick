@@ -16,6 +16,12 @@ if (!SHOPIFY_API_KEY || !SHOPIFY_API_SECRET) {
   process.exit(1);
 }
 
+// Trust the reverse proxy (Railway, Heroku, etc.) so req.secure works
+// and Express sets Secure cookies behind HTTPS-terminating proxies
+if (process.env.NODE_ENV === "production") {
+  app.set("trust proxy", 1);
+}
+
 app.use(
   session({
     secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString("hex"),
@@ -23,7 +29,7 @@ app.use(
     saveUninitialized: false,
     cookie: {
       secure: process.env.NODE_ENV === "production",
-      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+      sameSite: "lax",
     },
   })
 );
