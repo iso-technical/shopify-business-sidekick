@@ -100,35 +100,59 @@ app.get("/", (req, res) => {
     return res.redirect("/dashboard");
   }
 
-  // Shopify admin sends ?shop=store.myshopify.com — auto-redirect to OAuth
+  // Shopify admin sends ?shop=store.myshopify.com — redirect to /install
+  // so OAuth completes in a normal browser tab, not inside the iframe
   if (shop && shop.match(/^[a-zA-Z0-9-]+\.myshopify\.com$/)) {
-    return res.redirect(`/auth?shop=${encodeURIComponent(shop)}`);
+    return res.redirect(`/install?shop=${encodeURIComponent(shop)}`);
   }
 
-  // No shop param and no session — show manual install form
+  // No shop param and no session — send to install page
+  res.redirect("/install");
+});
+
+// OAuth landing page — runs in a normal browser tab, not embedded
+app.get("/install", (req, res) => {
+  // If already authenticated, skip straight to dashboard
+  if (req.session.shop && req.session.accessToken) {
+    return res.redirect("/dashboard");
+  }
+
+  const shop = req.query.shop || "";
+  const error = req.query.error || "";
+
+  // Prevent this page from loading inside an iframe
+  res.setHeader("X-Frame-Options", "DENY");
+
   res.send(`
     <!DOCTYPE html>
     <html lang="en">
-    <head><meta charset="utf-8"><title>Shopify Dashboard App</title>
-    <style>
-      body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f6f6f7; }
-      .card { background: #fff; border-radius: 12px; padding: 48px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); text-align: center; max-width: 420px; }
-      h1 { margin: 0 0 8px; font-size: 24px; }
-      p { color: #6b7177; margin: 0 0 24px; }
-      form { display: flex; gap: 8px; }
-      input { flex: 1; padding: 10px 14px; border: 1px solid #c9cccf; border-radius: 8px; font-size: 14px; }
-      button { padding: 10px 20px; background: #008060; color: #fff; border: none; border-radius: 8px; font-size: 14px; cursor: pointer; }
-      button:hover { background: #006e52; }
-    </style>
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Install — Shopify Dashboard App</title>
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f6f6f7; }
+        .card { background: #fff; border-radius: 12px; padding: 48px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); text-align: center; max-width: 440px; width: 100%; }
+        h1 { margin: 0 0 8px; font-size: 24px; color: #1a1a1a; }
+        p { color: #6b7177; margin: 0 0 24px; font-size: 15px; line-height: 1.5; }
+        .error { background: #fef2f2; color: #b91c1c; padding: 10px 14px; border-radius: 8px; margin-bottom: 20px; font-size: 14px; }
+        form { display: flex; flex-direction: column; gap: 12px; }
+        input { padding: 12px 14px; border: 1px solid #c9cccf; border-radius: 8px; font-size: 14px; }
+        button { padding: 12px 20px; background: #008060; color: #fff; border: none; border-radius: 8px; font-size: 15px; font-weight: 500; cursor: pointer; }
+        button:hover { background: #006e52; }
+        .hint { color: #999; font-size: 13px; margin-top: 8px; }
+      </style>
     </head>
     <body>
       <div class="card">
         <h1>Shopify Dashboard</h1>
-        <p>Enter your Shopify store domain to connect.</p>
+        <p>Connect your Shopify store to get started.</p>
+        ${error === "token_expired" ? '<div class="error">Your session expired. Please reconnect.</div>' : ""}
         <form action="/auth" method="GET">
-          <input type="text" name="shop" placeholder="your-store.myshopify.com" required />
-          <button type="submit">Connect</button>
+          <input type="text" name="shop" placeholder="your-store.myshopify.com" value="${escapeHtml(shop)}" required />
+          <button type="submit">Authorize App</button>
         </form>
+        <p class="hint">You'll be redirected to Shopify to approve access.</p>
       </div>
     </body>
     </html>
@@ -208,12 +232,12 @@ app.get("/auth/callback", async (req, res) => {
 app.get("/dashboard", async (req, res) => {
   const { shop, accessToken, pendingShop } = req.session;
   if (!shop || !accessToken) {
-    // Preserve shop context so "/" can auto-redirect to OAuth
+    // Preserve shop context so /install can pre-fill the domain
     const knownShop = req.query.shop || pendingShop;
     if (knownShop) {
-      return res.redirect(`/?shop=${encodeURIComponent(knownShop)}`);
+      return res.redirect(`/install?shop=${encodeURIComponent(knownShop)}`);
     }
-    return res.redirect("/");
+    return res.redirect("/install");
   }
 
   try {
@@ -232,7 +256,7 @@ app.get("/dashboard", async (req, res) => {
     console.error("Dashboard error:", err);
     if (err.message.includes("401")) {
       req.session.destroy(() => {});
-      return res.redirect("/?error=token_expired");
+      return res.redirect("/install?error=token_expired");
     }
     res.status(500).send("Failed to load dashboard. Check server logs.");
   }
