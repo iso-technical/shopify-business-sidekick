@@ -13,6 +13,7 @@ const HOST = process.env.HOST; // e.g. https://your-app.up.railway.app
 const APP_HANDLE = process.env.APP_HANDLE || "mr-bean";
 const GA_PROPERTY_ID = process.env.GA_PROPERTY_ID;
 const GA_SERVICE_ACCOUNT_JSON = process.env.GA_SERVICE_ACCOUNT_JSON;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 if (!SHOPIFY_API_KEY || !SHOPIFY_API_SECRET) {
   console.error("Missing SHOPIFY_API_KEY or SHOPIFY_API_SECRET env vars");
@@ -209,6 +210,47 @@ async function fetchGoogleAnalyticsData() {
 
   console.log("[ga] data:", metrics);
   return metrics;
+}
+
+async function generateInsights(shopifyStats, gaData) {
+  if (!ANTHROPIC_API_KEY) {
+    console.log("[insights] ANTHROPIC_API_KEY not set");
+    return null;
+  }
+
+  const Anthropic = require("@anthropic-ai/sdk");
+  const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+
+  let dataPrompt = "You are a business analyst. Based on this e-commerce data, provide 3-5 actionable insights:\n\n";
+
+  dataPrompt += `Shopify (last 30 days):\n`;
+  dataPrompt += `- Orders: ${shopifyStats.orderCount}\n`;
+  dataPrompt += `- Revenue: $${shopifyStats.revenue.toFixed(2)}\n`;
+  dataPrompt += `- Average order value: $${shopifyStats.avgOrderValue.toFixed(2)}\n\n`;
+
+  if (gaData) {
+    dataPrompt += `Google Analytics (last 30 days):\n`;
+    dataPrompt += `- Sessions: ${gaData.sessions}\n`;
+    dataPrompt += `- Users: ${gaData.users}\n`;
+    dataPrompt += `- Page views: ${gaData.pageViews}\n`;
+    dataPrompt += `- Bounce rate: ${(gaData.bounceRate * 100).toFixed(1)}%\n\n`;
+  } else {
+    dataPrompt += `Google Analytics: Not connected\n\n`;
+  }
+
+  dataPrompt += "Provide clear, specific recommendations to improve the business.";
+
+  console.log("[insights] sending data to Claude...");
+
+  const message = await client.messages.create({
+    model: "claude-sonnet-4-5-20250929",
+    max_tokens: 1024,
+    messages: [{ role: "user", content: dataPrompt }],
+  });
+
+  const text = message.content[0]?.text || "";
+  console.log("[insights] received response, length:", text.length);
+  return text;
 }
 
 // --- Routes ---
@@ -453,6 +495,64 @@ app.get("/disconnect", (req, res) => {
   });
 });
 
+// AI Insights — fetch Shopify + GA data and generate Claude analysis
+app.get("/insights", async (req, res) => {
+  const shop = req.query.shop;
+  const tokenData = shop ? getShopToken(shop) : null;
+
+  if (!shop || !tokenData) {
+    return res.status(401).json({ error: "Not authenticated" });
+  }
+
+  if (!ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured" });
+  }
+
+  try {
+    const { accessToken } = tokenData;
+
+    // Fetch last 30 days of orders from Shopify
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const sinceDate = thirtyDaysAgo.toISOString();
+
+    console.log("[insights] fetching Shopify orders since:", sinceDate);
+    const ordersData = await shopifyFetch(
+      shop,
+      accessToken,
+      `orders?status=any&created_at_min=${encodeURIComponent(sinceDate)}&limit=250`
+    );
+    const orders = ordersData.orders || [];
+
+    const orderCount = orders.length;
+    const revenue = orders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
+    const avgOrderValue = orderCount > 0 ? revenue / orderCount : 0;
+
+    const shopifyStats = { orderCount, revenue, avgOrderValue };
+    console.log("[insights] shopify stats:", shopifyStats);
+
+    // Fetch GA data (may be null if not configured)
+    let gaData = null;
+    try {
+      gaData = await fetchGoogleAnalyticsData();
+    } catch (gaErr) {
+      console.log("[insights] GA fetch failed (continuing without):", gaErr.message);
+    }
+
+    // Generate insights with Claude
+    const insights = await generateInsights(shopifyStats, gaData);
+
+    res.json({
+      shopifyStats,
+      gaData,
+      insights,
+    });
+  } catch (err) {
+    console.error("[insights] error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Test Google Analytics — verify service account connection
 app.get("/test-ga", async (_req, res) => {
   try {
@@ -557,6 +657,12 @@ function buildDashboardHtml(storeName, shop, products, orders) {
         th { text-align: left; padding: 10px 12px; border-bottom: 2px solid #e1e3e5; color: #6b7177; font-weight: 500; font-size: 13px; }
         td { padding: 10px 12px; border-bottom: 1px solid #f1f1f1; }
         .empty { color: #999; font-style: italic; padding: 16px 0; }
+        .insights-loading { color: #6b7177; font-size: 14px; }
+        .insights-loading .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #e1e3e5; border-top-color: #008060; border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 8px; vertical-align: middle; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .insights-content { font-size: 14px; line-height: 1.7; color: #333; white-space: pre-wrap; }
+        .insights-error { color: #b91c1c; font-size: 14px; }
+        .insights-badge { display: inline-block; background: #f0fdf4; color: #166534; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px; margin-left: 8px; vertical-align: middle; }
       </style>
     </head>
     <body>
@@ -570,6 +676,31 @@ function buildDashboardHtml(storeName, shop, products, orders) {
       </div>
       <div class="connected">Connected to: <strong>${escapeHtml(storeName)}</strong> (${escapeHtml(shop)})</div>
       <div class="container">
+        ${ANTHROPIC_API_KEY ? `
+        <div class="section">
+          <h2>AI Insights <span class="insights-badge">Claude</span></h2>
+          <div id="insights">
+            <p class="insights-loading"><span class="spinner"></span>Analyzing your store data...</p>
+          </div>
+        </div>
+        <script>
+          fetch("/insights?shop=${encodeURIComponent(shop)}")
+            .then(r => r.json())
+            .then(data => {
+              const el = document.getElementById("insights");
+              if (data.error) {
+                el.innerHTML = '<p class="insights-error">' + data.error + '</p>';
+              } else if (data.insights) {
+                el.innerHTML = '<div class="insights-content">' + data.insights.replace(/</g, "&lt;").replace(/>/g, "&gt;") + '</div>';
+              } else {
+                el.innerHTML = '<p class="insights-error">No insights generated.</p>';
+              }
+            })
+            .catch(err => {
+              document.getElementById("insights").innerHTML = '<p class="insights-error">Failed to load insights.</p>';
+            });
+        </script>
+        ` : ""}
         <div class="section">
           <h2>Recent Products</h2>
           ${
