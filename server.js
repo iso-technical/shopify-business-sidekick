@@ -14,6 +14,8 @@ const APP_HANDLE = process.env.APP_HANDLE || "mr-bean";
 const GA_PROPERTY_ID = process.env.GA_PROPERTY_ID;
 const GA_SERVICE_ACCOUNT_JSON = process.env.GA_SERVICE_ACCOUNT_JSON;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const META_APP_ID = process.env.META_APP_ID;
+const META_APP_SECRET = process.env.META_APP_SECRET;
 
 if (!SHOPIFY_API_KEY || !SHOPIFY_API_SECRET) {
   console.error("Missing SHOPIFY_API_KEY or SHOPIFY_API_SECRET env vars");
@@ -35,6 +37,9 @@ function setShopToken(shop, accessToken) {
     accessToken,
     installedAt: Date.now(),
     metaAdsToken: existing?.metaAdsToken || null,
+    metaAdsUserId: existing?.metaAdsUserId || null,
+    metaAdAccountId: existing?.metaAdAccountId || null,
+    metaAdAccountName: existing?.metaAdAccountName || null,
   };
   console.log("[store] saved token for", shop);
 }
@@ -715,6 +720,150 @@ app.get("/test-ga", async (_req, res) => {
   }
 });
 
+// Meta Ads — initiate Facebook OAuth
+app.get("/connect/meta", (req, res) => {
+  const shop = req.query.shop;
+  if (!shop || !getShopToken(shop)) {
+    return res.redirect("/install");
+  }
+
+  if (!META_APP_ID || !META_APP_SECRET) {
+    console.log("[meta] META_APP_ID or META_APP_SECRET not configured");
+    return res.status(500).send("Meta Ads integration not configured. Set META_APP_ID and META_APP_SECRET in .env");
+  }
+
+  const nonce = generateNonce();
+  req.session.metaNonce = nonce;
+  req.session.metaShop = shop;
+
+  const redirectUri = `${HOST}/connect/meta/callback`;
+  const authUrl =
+    `https://www.facebook.com/v18.0/dialog/oauth` +
+    `?client_id=${META_APP_ID}` +
+    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+    `&scope=ads_read` +
+    `&state=${nonce}`;
+
+  console.log("[meta] redirecting to Facebook OAuth for shop:", shop);
+
+  // Break out of Shopify iframe
+  res.setHeader("X-Frame-Options", "DENY");
+  res.redirect(authUrl);
+});
+
+// Meta Ads — handle Facebook OAuth callback
+app.get("/connect/meta/callback", async (req, res) => {
+  const { code, state, error, error_description } = req.query;
+
+  console.log("[meta-callback] state from query:", state);
+  console.log("[meta-callback] nonce from session:", req.session.metaNonce);
+  console.log("[meta-callback] error:", error || "(none)");
+
+  if (error) {
+    console.log("[meta-callback] OAuth error:", error, error_description);
+    const shop = req.session.metaShop;
+    return res.redirect(`/settings?shop=${encodeURIComponent(shop || "")}&error=meta_denied`);
+  }
+
+  // Verify state/nonce
+  if (state !== req.session.metaNonce) {
+    console.log("[meta-callback] STATE MISMATCH");
+    return res.status(403).send("State mismatch — possible CSRF attack.");
+  }
+
+  const shop = req.session.metaShop;
+  if (!shop || !getShopToken(shop)) {
+    return res.redirect("/install");
+  }
+
+  try {
+    const redirectUri = `${HOST}/connect/meta/callback`;
+
+    // Exchange code for short-lived token
+    console.log("[meta-callback] exchanging code for access token...");
+    const tokenUrl =
+      `https://graph.facebook.com/v18.0/oauth/access_token` +
+      `?client_id=${META_APP_ID}` +
+      `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+      `&client_secret=${META_APP_SECRET}` +
+      `&code=${encodeURIComponent(code)}`;
+
+    const tokenRes = await fetch(tokenUrl);
+    const tokenData = await tokenRes.json();
+
+    console.log("[meta-callback] token response status:", tokenRes.status);
+
+    if (tokenData.error) {
+      console.error("[meta-callback] token error:", tokenData.error);
+      return res.redirect(`/settings?shop=${encodeURIComponent(shop)}&error=meta_token_failed`);
+    }
+
+    const shortLivedToken = tokenData.access_token;
+
+    // Exchange for long-lived token (60 days)
+    console.log("[meta-callback] exchanging for long-lived token...");
+    const longLivedUrl =
+      `https://graph.facebook.com/v18.0/oauth/access_token` +
+      `?grant_type=fb_exchange_token` +
+      `&client_id=${META_APP_ID}` +
+      `&client_secret=${META_APP_SECRET}` +
+      `&fb_exchange_token=${encodeURIComponent(shortLivedToken)}`;
+
+    const longLivedRes = await fetch(longLivedUrl);
+    const longLivedData = await longLivedRes.json();
+
+    if (longLivedData.error) {
+      console.error("[meta-callback] long-lived token error:", longLivedData.error);
+      // Fall back to short-lived token
+      console.log("[meta-callback] falling back to short-lived token");
+    }
+
+    const accessToken = longLivedData.access_token || shortLivedToken;
+    console.log("[meta-callback] got access token, length:", accessToken.length);
+
+    // Get user ID
+    console.log("[meta-callback] fetching user ID...");
+    const meRes = await fetch(`https://graph.facebook.com/v18.0/me?access_token=${encodeURIComponent(accessToken)}`);
+    const meData = await meRes.json();
+    const userId = meData.id || null;
+    console.log("[meta-callback] user ID:", userId);
+
+    // Get ad accounts
+    console.log("[meta-callback] fetching ad accounts...");
+    const adAccountsRes = await fetch(
+      `https://graph.facebook.com/v18.0/me/adaccounts?fields=id,name&access_token=${encodeURIComponent(accessToken)}`
+    );
+    const adAccountsData = await adAccountsRes.json();
+    const adAccounts = adAccountsData.data || [];
+
+    console.log("[meta-callback] found", adAccounts.length, "ad accounts");
+    if (adAccounts.length > 0) {
+      console.log("[meta-callback] first account:", adAccounts[0].id, adAccounts[0].name);
+    }
+
+    // Store Meta tokens in shopTokens
+    const tokenEntry = getShopToken(shop);
+    tokenEntry.metaAdsToken = accessToken;
+    tokenEntry.metaAdsUserId = userId;
+    tokenEntry.metaAdAccountId = adAccounts[0]?.id || null;
+    tokenEntry.metaAdAccountName = adAccounts[0]?.name || null;
+
+    console.log("[meta-callback] saved Meta tokens for shop:", shop);
+
+    // Clear insights cache so next dashboard load picks up Meta data
+    delete insightsCache[shop];
+
+    // Redirect back to Shopify admin settings
+    const storeSlug = shop.replace(".myshopify.com", "");
+    const adminUrl = `https://admin.shopify.com/store/${storeSlug}/apps/${APP_HANDLE}`;
+    console.log("[meta-callback] redirecting to:", adminUrl);
+    res.redirect(adminUrl);
+  } catch (err) {
+    console.error("[meta-callback] error:", err);
+    res.redirect(`/settings?shop=${encodeURIComponent(shop)}&error=meta_failed`);
+  }
+});
+
 // Settings — data source connection status
 app.get("/settings", (req, res) => {
   const shop = req.query.shop;
@@ -988,8 +1137,10 @@ function buildSettingsHtml(shop, tokenData) {
               </div>
             </div>
             ${metaConnected
-              ? '<span class="status-connected">&#10003; Connected</span>'
-              : `<a class="btn-connect" href="/connect/meta?shop=${shopParam}">Connect</a>`
+              ? `<span class="status-connected">&#10003; Connected${tokenData.metaAdAccountName ? ` (${escapeHtml(tokenData.metaAdAccountName)})` : ""}</span>`
+              : (META_APP_ID
+                ? `<a class="btn-connect" href="/connect/meta?shop=${shopParam}">Connect</a>`
+                : '<span style="color:#6b7177;font-size:13px">Not configured &mdash; add META_APP_ID to env</span>')
             }
           </div>
 
