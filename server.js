@@ -79,10 +79,11 @@ app.use(
   session({
     secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString("hex"),
     resave: false,
-    saveUninitialized: false,
+    saveUninitialized: true,
     cookie: {
       secure: process.env.NODE_ENV === "production",
       sameSite: "lax",
+      maxAge: 3600000, // 1 hour — enough for OAuth flows to complete
     },
   })
 );
@@ -778,8 +779,12 @@ app.get("/connect/meta", (req, res) => {
 app.get("/connect/meta/callback", async (req, res) => {
   const { code, state, error, error_description } = req.query;
 
+  console.log("[meta-callback] --- DEBUG SESSION ---");
+  console.log("[meta-callback] session ID:", req.sessionID);
   console.log("[meta-callback] state from query:", state);
   console.log("[meta-callback] nonce from session:", req.session.metaNonce);
+  console.log("[meta-callback] shop from session:", req.session.metaShop);
+  console.log("[meta-callback] all session data:", JSON.stringify(req.session));
   console.log("[meta-callback] error:", error || "(none)");
 
   if (error) {
