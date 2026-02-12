@@ -485,7 +485,46 @@ app.get("/dashboard", async (req, res) => {
     const products = productsData.products || [];
     const orders = ordersData.orders || [];
 
-    res.send(buildDashboardHtml(storeName, shop, products, orders));
+    // Generate AI insights server-side
+    let insights = null;
+    if (ANTHROPIC_API_KEY) {
+      try {
+        console.log("[dashboard] generating insights...");
+
+        // Fetch last 30 days of orders for stats
+        const thirtyDaysAgo = new Date();
+        thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+        const sinceDate = thirtyDaysAgo.toISOString();
+
+        const allOrdersData = await shopifyFetch(
+          shop,
+          accessToken,
+          `orders?status=any&created_at_min=${encodeURIComponent(sinceDate)}&limit=250`
+        );
+        const allOrders = allOrdersData.orders || [];
+
+        const orderCount = allOrders.length;
+        const revenue = allOrders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
+        const avgOrderValue = orderCount > 0 ? revenue / orderCount : 0;
+        const shopifyStats = { orderCount, revenue, avgOrderValue };
+
+        // Fetch GA data (may be null if not configured)
+        let gaData = null;
+        try {
+          gaData = await fetchGoogleAnalyticsData();
+        } catch (gaErr) {
+          console.log("[dashboard] GA fetch failed (continuing without):", gaErr.message);
+        }
+
+        insights = await generateInsights(shopifyStats, gaData);
+        console.log("[dashboard] insights generated, length:", insights?.length || 0);
+      } catch (insightsErr) {
+        console.error("[dashboard] insights generation failed:", insightsErr.message);
+        insights = null;
+      }
+    }
+
+    res.send(buildDashboardHtml(storeName, shop, products, orders, insights));
   } catch (err) {
     console.error("Dashboard error:", err);
     if (err.message.includes("401")) {
@@ -611,9 +650,7 @@ app.get("/health", (_req, res) => {
 
 // --- Dashboard HTML builder ---
 
-function buildDashboardHtml(storeName, shop, products, orders) {
-  console.log("[dashboard-html] ANTHROPIC_API_KEY configured:", !!ANTHROPIC_API_KEY);
-  console.log("[dashboard-html] insights section will render:", !!ANTHROPIC_API_KEY);
+function buildDashboardHtml(storeName, shop, products, orders, insights) {
 
   const productRows = products
     .map(
@@ -672,9 +709,6 @@ function buildDashboardHtml(storeName, shop, products, orders) {
         th { text-align: left; padding: 10px 12px; border-bottom: 2px solid #e1e3e5; color: #6b7177; font-weight: 500; font-size: 13px; }
         td { padding: 10px 12px; border-bottom: 1px solid #f1f1f1; }
         .empty { color: #999; font-style: italic; padding: 16px 0; }
-        .insights-loading { color: #6b7177; font-size: 14px; }
-        .insights-loading .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #e1e3e5; border-top-color: #008060; border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 8px; vertical-align: middle; }
-        @keyframes spin { to { transform: rotate(360deg); } }
         .insights-content { font-size: 14px; line-height: 1.7; color: #333; white-space: pre-wrap; }
         .insights-error { color: #b91c1c; font-size: 14px; }
         .insights-badge { display: inline-block; background: #f0fdf4; color: #166534; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px; margin-left: 8px; vertical-align: middle; }
@@ -691,12 +725,14 @@ function buildDashboardHtml(storeName, shop, products, orders) {
       </div>
       <div class="connected">Connected to: <strong>${escapeHtml(storeName)}</strong> (${escapeHtml(shop)})</div>
       <div class="container">
-        <!-- ANTHROPIC_API_KEY configured: ${ANTHROPIC_API_KEY ? "YES" : "NO"} -->
         ${ANTHROPIC_API_KEY ? `
         <div class="section">
           <h2>AI Insights <span class="insights-badge">Claude</span></h2>
           <div id="insights">
-            <p class="insights-loading"><span class="spinner"></span>Analyzing your store data...</p>
+            ${insights
+              ? `<div class="insights-content">${escapeHtml(insights)}</div>`
+              : '<p class="insights-error">Unable to generate insights.</p>'
+            }
           </div>
         </div>
         ` : ""}
@@ -724,7 +760,6 @@ function buildDashboardHtml(storeName, shop, products, orders) {
           }
         </div>
       </div>
-      ${ANTHROPIC_API_KEY ? `<script src="/dashboard.js" data-shop="${escapeHtml(shop)}"></script>` : ""}
     </body>
     </html>
   `;
