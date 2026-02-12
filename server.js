@@ -44,6 +44,9 @@ function deleteShopToken(shop) {
   console.log("[store] deleted token for", shop);
 }
 
+app.use(express.json());
+app.use(express.static("public"));
+
 // Trust the reverse proxy (Railway, Heroku, etc.) so req.secure works
 // and Express sets Secure cookies behind HTTPS-terminating proxies
 if (process.env.NODE_ENV === "production") {
@@ -61,9 +64,6 @@ app.use(
     },
   })
 );
-
-app.use(express.json());
-app.use(express.static("public"));
 
 // CORS — allow fetch requests from Shopify admin iframe
 app.use((req, res, next) => {
