@@ -252,9 +252,13 @@ async function generateInsights(shopifyStats, gaData) {
 
   let dataPrompt = `You're a trusted e-commerce advisor speaking directly to a store owner.\nData from the last 30 days:\n\n`;
 
-  dataPrompt += `Orders: ${shopifyStats.orderCount}\n`;
-  dataPrompt += `Revenue: \u00a3${shopifyStats.revenue.toFixed(2)}\n`;
-  dataPrompt += `Average order value: \u00a3${shopifyStats.avgOrderValue.toFixed(2)}\n`;
+  dataPrompt += `Orders: ${shopifyStats.orderCount.toLocaleString()} (exact count)\n`;
+  dataPrompt += `Average order value: \u00a3${shopifyStats.avgOrderValue.toFixed(2)} (based on ${shopifyStats.sampleSize} order sample)\n`;
+  if (shopifyStats.revenueIsEstimated) {
+    dataPrompt += `Estimated revenue: ~\u00a3${shopifyStats.revenue.toFixed(2)} (AOV \u00d7 order count)\n`;
+  } else {
+    dataPrompt += `Revenue: \u00a3${shopifyStats.revenue.toFixed(2)}\n`;
+  }
 
   if (gaData) {
     dataPrompt += `Website sessions: ${gaData.sessions.toLocaleString()}\n`;
@@ -264,7 +268,9 @@ async function generateInsights(shopifyStats, gaData) {
     dataPrompt += `Website analytics: Not connected\n`;
   }
 
-  dataPrompt += `\nRespond in a conversational tone (like texting a knowledgeable friend, not writing a consultant report):\n`;
+  dataPrompt += `\nIMPORTANT: Do NOT calculate conversion rate (orders \u00f7 sessions) — the data sources aren't linked and the result would be misleading. Focus on the metrics you have.\n`;
+  dataPrompt += `If revenue is marked as estimated, mention that briefly.\n\n`;
+  dataPrompt += `Respond in a conversational tone (like texting a knowledgeable friend, not writing a consultant report):\n`;
   dataPrompt += `**Status:** One line — is the business healthy, struggling, or thriving?\n`;
   dataPrompt += `**The Main Issue:** What's the biggest problem hurting performance right now? Be specific.\n`;
   dataPrompt += `**Why It Matters:** Show the financial impact in real \u00a3 numbers.\n`;
@@ -529,17 +535,33 @@ app.get("/dashboard", async (req, res) => {
           thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
           const sinceDate = thirtyDaysAgo.toISOString();
 
-          const allOrdersData = await shopifyFetch(
-            shop,
-            accessToken,
-            `orders?status=any&created_at_min=${encodeURIComponent(sinceDate)}&limit=250`
-          );
-          const allOrders = allOrdersData.orders || [];
+          // Get EXACT order count via count endpoint + sample for AOV
+          const [countData, sampleData] = await Promise.all([
+            shopifyFetch(
+              shop,
+              accessToken,
+              `orders/count?status=any&created_at_min=${encodeURIComponent(sinceDate)}`
+            ),
+            shopifyFetch(
+              shop,
+              accessToken,
+              `orders?status=any&financial_status=paid&created_at_min=${encodeURIComponent(sinceDate)}&limit=250`
+            ),
+          ]);
 
-          const orderCount = allOrders.length;
-          const revenue = allOrders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
-          const avgOrderValue = orderCount > 0 ? revenue / orderCount : 0;
-          const shopifyStats = { orderCount, revenue, avgOrderValue };
+          const orderCount = countData.count || 0;
+          const sampleOrders = sampleData.orders || [];
+          const sampleSize = sampleOrders.length;
+          const sampleRevenue = sampleOrders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
+          const avgOrderValue = sampleSize > 0 ? sampleRevenue / sampleSize : 0;
+
+          // Revenue: exact if we have all orders, estimated if sample < total
+          const revenueIsEstimated = sampleSize < orderCount;
+          const revenue = revenueIsEstimated ? avgOrderValue * orderCount : sampleRevenue;
+
+          console.log("[dashboard] order count (exact):", orderCount, "| sample:", sampleSize, "| AOV:", avgOrderValue.toFixed(2), "| revenue estimated:", revenueIsEstimated);
+
+          const shopifyStats = { orderCount, revenue, avgOrderValue, sampleSize, revenueIsEstimated };
 
           // Fetch GA data (may be null if not configured)
           let gaData = null;
@@ -601,24 +623,34 @@ app.get("/insights", async (req, res) => {
   try {
     const { accessToken } = tokenData;
 
-    // Fetch last 30 days of orders from Shopify
+    // Fetch last 30 days — exact count + sample for AOV
     const thirtyDaysAgo = new Date();
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
     const sinceDate = thirtyDaysAgo.toISOString();
 
-    console.log("[insights] fetching Shopify orders since:", sinceDate);
-    const ordersData = await shopifyFetch(
-      shop,
-      accessToken,
-      `orders?status=any&created_at_min=${encodeURIComponent(sinceDate)}&limit=250`
-    );
-    const orders = ordersData.orders || [];
+    console.log("[insights] fetching Shopify order stats since:", sinceDate);
+    const [countData, sampleData] = await Promise.all([
+      shopifyFetch(
+        shop,
+        accessToken,
+        `orders/count?status=any&created_at_min=${encodeURIComponent(sinceDate)}`
+      ),
+      shopifyFetch(
+        shop,
+        accessToken,
+        `orders?status=any&financial_status=paid&created_at_min=${encodeURIComponent(sinceDate)}&limit=250`
+      ),
+    ]);
 
-    const orderCount = orders.length;
-    const revenue = orders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
-    const avgOrderValue = orderCount > 0 ? revenue / orderCount : 0;
+    const orderCount = countData.count || 0;
+    const sampleOrders = sampleData.orders || [];
+    const sampleSize = sampleOrders.length;
+    const sampleRevenue = sampleOrders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
+    const avgOrderValue = sampleSize > 0 ? sampleRevenue / sampleSize : 0;
+    const revenueIsEstimated = sampleSize < orderCount;
+    const revenue = revenueIsEstimated ? avgOrderValue * orderCount : sampleRevenue;
 
-    const shopifyStats = { orderCount, revenue, avgOrderValue };
+    const shopifyStats = { orderCount, revenue, avgOrderValue, sampleSize, revenueIsEstimated };
     console.log("[insights] shopify stats:", shopifyStats);
 
     // Fetch GA data (may be null if not configured)
@@ -737,7 +769,7 @@ function buildDashboardHtml(storeName, shop, products, orders, insightsData) {
     freshnessHtml = `
       <div class="freshness">
         <div class="freshness-sources">
-          <span class="freshness-item connected-source">Shopify: ${stats.orderCount} orders (${dateRange})</span>
+          <span class="freshness-item connected-source">Shopify: ${stats.orderCount.toLocaleString()} orders (${dateRange})</span>
           ${ga
             ? `<span class="freshness-item connected-source">Google Analytics: ${ga.sessions.toLocaleString()} sessions (${dateRange})</span>`
             : `<span class="freshness-item disconnected-source">Google Analytics: Not connected</span>`
