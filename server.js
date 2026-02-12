@@ -720,7 +720,7 @@ app.get("/test-ga", async (_req, res) => {
   }
 });
 
-// Meta Ads — initiate Facebook OAuth
+// Meta Ads — show authorization page (breaks out of iframe)
 app.get("/connect/meta", (req, res) => {
   const shop = req.query.shop;
   if (!shop || !getShopToken(shop)) {
@@ -744,11 +744,34 @@ app.get("/connect/meta", (req, res) => {
     `&scope=ads_read` +
     `&state=${nonce}`;
 
-  console.log("[meta] redirecting to Facebook OAuth for shop:", shop);
+  console.log("[meta] showing authorize page for shop:", shop);
 
-  // Break out of Shopify iframe
   res.setHeader("X-Frame-Options", "DENY");
-  res.redirect(authUrl);
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Connect Meta Ads</title>
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f6f6f7; }
+        .card { background: #fff; border-radius: 12px; padding: 48px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); text-align: center; max-width: 440px; }
+        h1 { margin: 0 0 8px; font-size: 22px; color: #1a1a1a; }
+        p { color: #6b7177; margin: 0 0 24px; font-size: 15px; line-height: 1.5; }
+        a.btn { display: inline-block; padding: 12px 28px; background: #1877f2; color: #fff; text-decoration: none; border-radius: 8px; font-size: 15px; font-weight: 500; }
+        a.btn:hover { background: #1565c0; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>Connect Meta Ads</h1>
+        <p>Click below to connect your Meta Ads account. A new window will open to complete authorization.</p>
+        <a class="btn" href="${escapeHtml(authUrl)}" target="_blank">Authorize Meta Ads</a>
+      </div>
+    </body>
+    </html>
+  `);
 });
 
 // Meta Ads — handle Facebook OAuth callback
@@ -853,11 +876,38 @@ app.get("/connect/meta/callback", async (req, res) => {
     // Clear insights cache so next dashboard load picks up Meta data
     delete insightsCache[shop];
 
-    // Redirect back to Shopify admin settings
+    // Show success page — this is in a popup/new tab
+    const accountName = adAccounts[0]?.name || "your account";
     const storeSlug = shop.replace(".myshopify.com", "");
     const adminUrl = `https://admin.shopify.com/store/${storeSlug}/apps/${APP_HANDLE}`;
-    console.log("[meta-callback] redirecting to:", adminUrl);
-    res.redirect(adminUrl);
+
+    res.send(`
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Meta Ads Connected</title>
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f6f6f7; }
+          .card { background: #fff; border-radius: 12px; padding: 48px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); text-align: center; max-width: 440px; }
+          .check { font-size: 48px; margin-bottom: 16px; }
+          h1 { margin: 0 0 8px; font-size: 22px; color: #1a1a1a; }
+          p { color: #6b7177; margin: 0 0 24px; font-size: 15px; line-height: 1.5; }
+          a.btn { display: inline-block; padding: 12px 28px; background: #008060; color: #fff; text-decoration: none; border-radius: 8px; font-size: 15px; font-weight: 500; }
+          a.btn:hover { background: #006e52; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <div class="check">&#10003;</div>
+          <h1>Meta Ads Connected</h1>
+          <p>Successfully connected to ${escapeHtml(accountName)}. You can close this window and return to your dashboard.</p>
+          <a class="btn" href="${escapeHtml(adminUrl)}">Back to Dashboard</a>
+        </div>
+      </body>
+      </html>
+    `);
   } catch (err) {
     console.error("[meta-callback] error:", err);
     res.redirect(`/settings?shop=${encodeURIComponent(shop)}&error=meta_failed`);
