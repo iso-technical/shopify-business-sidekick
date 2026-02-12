@@ -733,9 +733,10 @@ app.get("/connect/meta", (req, res) => {
     return res.status(500).send("Meta Ads integration not configured. Set META_APP_ID and META_APP_SECRET in .env");
   }
 
+  // Encode shop + nonce in the state parameter (travels through Facebook OAuth)
+  // This avoids relying on session cookies which can be lost across domains/tabs
   const nonce = generateNonce();
-  req.session.metaNonce = nonce;
-  req.session.metaShop = shop;
+  const statePayload = Buffer.from(JSON.stringify({ nonce, shop })).toString("base64");
 
   const redirectUri = `${HOST}/connect/meta/callback`;
   const authUrl =
@@ -743,73 +744,70 @@ app.get("/connect/meta", (req, res) => {
     `?client_id=${META_APP_ID}` +
     `&redirect_uri=${encodeURIComponent(redirectUri)}` +
     `&scope=ads_read` +
-    `&state=${nonce}`;
+    `&state=${encodeURIComponent(statePayload)}`;
 
-  console.log("[meta] showing authorize page for shop:", shop);
-  console.log("[meta] session ID:", req.sessionID, "| nonce:", nonce);
+  console.log("[meta] showing authorize page for shop:", shop, "| nonce:", nonce);
 
-  // Force session save before rendering — ensures nonce is persisted
-  // before the user clicks the button and Facebook redirects back
-  req.session.save((err) => {
-    if (err) {
-      console.error("[meta] session save error:", err);
-    }
-
-    res.setHeader("X-Frame-Options", "DENY");
-    res.send(`
-      <!DOCTYPE html>
-      <html lang="en">
-      <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Connect Meta Ads</title>
-        <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f6f6f7; }
-          .card { background: #fff; border-radius: 12px; padding: 48px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); text-align: center; max-width: 440px; }
-          h1 { margin: 0 0 8px; font-size: 22px; color: #1a1a1a; }
-          p { color: #6b7177; margin: 0 0 24px; font-size: 15px; line-height: 1.5; }
-          a.btn { display: inline-block; padding: 12px 28px; background: #1877f2; color: #fff; text-decoration: none; border-radius: 8px; font-size: 15px; font-weight: 500; }
-          a.btn:hover { background: #1565c0; }
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <h1>Connect Meta Ads</h1>
-          <p>Click below to connect your Meta Ads account. A new window will open to complete authorization.</p>
-          <a class="btn" href="${escapeHtml(authUrl)}" target="_blank">Authorize Meta Ads</a>
-        </div>
-      </body>
-      </html>
-    `);
-  });
+  res.setHeader("X-Frame-Options", "DENY");
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Connect Meta Ads</title>
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f6f6f7; }
+        .card { background: #fff; border-radius: 12px; padding: 48px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); text-align: center; max-width: 440px; }
+        h1 { margin: 0 0 8px; font-size: 22px; color: #1a1a1a; }
+        p { color: #6b7177; margin: 0 0 24px; font-size: 15px; line-height: 1.5; }
+        a.btn { display: inline-block; padding: 12px 28px; background: #1877f2; color: #fff; text-decoration: none; border-radius: 8px; font-size: 15px; font-weight: 500; }
+        a.btn:hover { background: #1565c0; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>Connect Meta Ads</h1>
+        <p>Click below to connect your Meta Ads account. A new window will open to complete authorization.</p>
+        <a class="btn" href="${escapeHtml(authUrl)}" target="_blank">Authorize Meta Ads</a>
+      </div>
+    </body>
+    </html>
+  `);
 });
 
 // Meta Ads — handle Facebook OAuth callback
 app.get("/connect/meta/callback", async (req, res) => {
   const { code, state, error, error_description } = req.query;
 
-  console.log("[meta-callback] --- DEBUG SESSION ---");
-  console.log("[meta-callback] session ID:", req.sessionID);
-  console.log("[meta-callback] state from query:", state);
-  console.log("[meta-callback] nonce from session:", req.session.metaNonce);
-  console.log("[meta-callback] shop from session:", req.session.metaShop);
-  console.log("[meta-callback] all session data:", JSON.stringify(req.session));
+  // Decode shop + nonce from state parameter (no session dependency)
+  let stateData = {};
+  try {
+    stateData = JSON.parse(Buffer.from(state || "", "base64").toString("utf8"));
+  } catch (e) {
+    console.error("[meta-callback] failed to decode state:", e.message);
+  }
+
+  const { nonce, shop } = stateData;
+
+  console.log("[meta-callback] --- DEBUG STATE ---");
+  console.log("[meta-callback] raw state:", state);
+  console.log("[meta-callback] decoded nonce:", nonce);
+  console.log("[meta-callback] decoded shop:", shop);
   console.log("[meta-callback] error:", error || "(none)");
 
   if (error) {
     console.log("[meta-callback] OAuth error:", error, error_description);
-    const shop = req.session.metaShop;
     return res.redirect(`/settings?shop=${encodeURIComponent(shop || "")}&error=meta_denied`);
   }
 
-  // Verify state/nonce
-  if (state !== req.session.metaNonce) {
-    console.log("[meta-callback] STATE MISMATCH");
-    return res.status(403).send("State mismatch — possible CSRF attack.");
+  // Verify we got valid state data
+  if (!nonce || !shop) {
+    console.log("[meta-callback] INVALID STATE — missing nonce or shop");
+    return res.status(403).send("Invalid state parameter.");
   }
 
-  const shop = req.session.metaShop;
-  if (!shop || !getShopToken(shop)) {
+  if (!getShopToken(shop)) {
     return res.redirect("/install");
   }
 
