@@ -247,7 +247,69 @@ async function fetchGoogleAnalyticsData() {
   return metrics;
 }
 
-async function generateTileInsights(shopifyStats, gaData) {
+async function fetchMetaAdsData(metaAdsToken, metaAdAccountId) {
+  if (!metaAdsToken || !metaAdAccountId) {
+    console.log("[meta-api] skipping — no token or ad account ID");
+    return null;
+  }
+
+  const today = new Date();
+  const thirtyDaysAgo = new Date(today);
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  const since = thirtyDaysAgo.toISOString().split("T")[0];
+  const until = today.toISOString().split("T")[0];
+
+  const timeRange = JSON.stringify({ since, until });
+  const fields = "spend,impressions,clicks,actions,action_values";
+  const url =
+    `https://graph.facebook.com/v18.0/${metaAdAccountId}/insights` +
+    `?access_token=${encodeURIComponent(metaAdsToken)}` +
+    `&time_range=${encodeURIComponent(timeRange)}` +
+    `&fields=${fields}` +
+    `&level=account`;
+
+  console.log("[meta-api] fetching ad insights for account:", metaAdAccountId);
+  console.log("[meta-api] date range:", since, "to", until);
+
+  const res = await fetch(url);
+  const data = await res.json();
+
+  console.log("[meta-api] response status:", res.status);
+
+  if (data.error) {
+    console.error("[meta-api] API error:", data.error.message);
+    throw new Error(`Meta Ads API error: ${data.error.message}`);
+  }
+
+  const row = data.data?.[0];
+  if (!row) {
+    console.log("[meta-api] no ad data returned (no active campaigns?)");
+    return { spend: 0, impressions: 0, clicks: 0, purchases: 0, revenue: 0 };
+  }
+
+  // Parse actions array to find purchase count
+  const actions = row.actions || [];
+  const purchaseAction = actions.find(a => a.action_type === "purchase" || a.action_type === "offsite_conversion.fb_pixel_purchase");
+  const purchases = purchaseAction ? parseInt(purchaseAction.value, 10) : 0;
+
+  // Parse action_values to find purchase revenue
+  const actionValues = row.action_values || [];
+  const purchaseValue = actionValues.find(a => a.action_type === "purchase" || a.action_type === "offsite_conversion.fb_pixel_purchase");
+  const revenue = purchaseValue ? parseFloat(purchaseValue.value) : 0;
+
+  const result = {
+    spend: parseFloat(row.spend || 0),
+    impressions: parseInt(row.impressions || 0, 10),
+    clicks: parseInt(row.clicks || 0, 10),
+    purchases,
+    revenue,
+  };
+
+  console.log("[meta-api] data:", result);
+  return result;
+}
+
+async function generateTileInsights(shopifyStats, gaData, metaAdsData) {
   if (!ANTHROPIC_API_KEY) {
     console.log("[insights] ANTHROPIC_API_KEY not set");
     return null;
@@ -275,6 +337,21 @@ async function generateTileInsights(shopifyStats, gaData) {
     dataContext += `Website analytics: Not connected\n`;
   }
 
+  if (metaAdsData) {
+    dataContext += `\nMeta Ads (last 30 days):\n`;
+    dataContext += `Ad spend: \u00a3${metaAdsData.spend.toFixed(2)}\n`;
+    dataContext += `Impressions: ${metaAdsData.impressions.toLocaleString()}\n`;
+    dataContext += `Clicks: ${metaAdsData.clicks.toLocaleString()}\n`;
+    dataContext += `Purchases from ads: ${metaAdsData.purchases}\n`;
+    dataContext += `Revenue from ads: \u00a3${metaAdsData.revenue.toFixed(2)}\n`;
+    const roas = metaAdsData.spend > 0 ? (metaAdsData.revenue / metaAdsData.spend).toFixed(2) : "N/A";
+    dataContext += `ROAS: ${roas}x\n`;
+  } else {
+    dataContext += `Meta Ads: Not connected\n`;
+  }
+
+  const hasMetaAds = !!metaAdsData;
+
   const prompt = `You're a sharp e-commerce advisor texting a store owner. Casual, direct, helpful.
 
 ${dataContext}
@@ -283,8 +360,8 @@ RULES:
 - Use \u00a3 for currency. If revenue is estimated, note it with a ~ prefix
 - Use "you" and "your". Be specific, not generic. Every word should help make a decision
 - Use emoji naturally but don't overdo it
-
-Respond with EXACTLY these 4 sections using ### headers:
+${hasMetaAds ? "- ROAS = Revenue from ads \u00f7 Ad spend. Use this to assess ad efficiency\n" : ""}
+Respond with EXACTLY these ${hasMetaAds ? "5" : "4"} sections using ### headers:
 
 ### HEALTH CHECK
 Status emoji (use exactly one: \ud83d\udfe2 healthy, \ud83d\udfe1 needs attention, or \ud83d\udd34 critical) then a one-line verdict.
@@ -297,21 +374,24 @@ What's costing the most money right now? State the specific problem, the \u00a3 
 One specific action for THIS WEEK. What to do, where to do it, and the expected impact. 30 words max.
 
 ### OPPORTUNITY
-One growth pattern you spot in the data. Specific recommendation with realistic \u00a3 potential over 30 days. 40 words max.`;
+One growth pattern you spot in the data. Specific recommendation with realistic \u00a3 potential over 30 days. 40 words max.${hasMetaAds ? `
+
+### AD PERFORMANCE
+Based on Meta Ads data, what's working and what's not? State the ROAS, whether it's good/bad, and one specific optimization to improve it. 40 words max.` : ""}`;
 
   console.log("[insights] sending tile prompt to Claude...");
 
   const message = await client.messages.create({
     model: "claude-sonnet-4-5-20250929",
-    max_tokens: 600,
+    max_tokens: hasMetaAds ? 800 : 600,
     messages: [{ role: "user", content: prompt }],
   });
 
   const text = message.content[0]?.text || "";
   console.log("[insights] received tile response, length:", text.length);
 
-  // Parse into 4 tiles by splitting on ### headers
-  const tiles = { healthCheck: "", biggestIssue: "", quickWin: "", opportunity: "" };
+  // Parse into tiles by splitting on ### headers
+  const tiles = { healthCheck: "", biggestIssue: "", quickWin: "", opportunity: "", adPerformance: "" };
   const sections = text.split(/###\s*/);
   for (const section of sections) {
     const trimmed = section.trim();
@@ -322,6 +402,7 @@ One growth pattern you spot in the data. Specific recommendation with realistic 
     else if (firstLine.includes("ISSUE")) tiles.biggestIssue = body;
     else if (firstLine.includes("QUICK") || firstLine.includes("WIN")) tiles.quickWin = body;
     else if (firstLine.includes("OPPORTUN")) tiles.opportunity = body;
+    else if (firstLine.includes("AD") && firstLine.includes("PERF")) tiles.adPerformance = body;
   }
 
   console.log("[insights] parsed tiles:", Object.keys(tiles).map(k => `${k}: ${tiles[k].length} chars`));
@@ -595,9 +676,18 @@ app.get("/dashboard", async (req, res) => {
             console.log("[dashboard] GA fetch failed (continuing without):", gaErr.message);
           }
 
-          const tiles = await generateTileInsights(shopifyStats, gaData);
+          let metaAdsData = null;
+          if (tokenData.metaAdsToken && tokenData.metaAdAccountId) {
+            try {
+              metaAdsData = await fetchMetaAdsData(tokenData.metaAdsToken, tokenData.metaAdAccountId);
+            } catch (metaErr) {
+              console.log("[dashboard] Meta Ads fetch failed (continuing without):", metaErr.message);
+            }
+          }
 
-          insightsData = { tiles, shopifyStats, gaData };
+          const tiles = await generateTileInsights(shopifyStats, gaData, metaAdsData);
+
+          insightsData = { tiles, shopifyStats, gaData, metaAdsData };
           setCachedInsights(shop, insightsData);
           insightsData = getCachedInsights(shop);
         } catch (insightsErr) {
@@ -683,12 +773,23 @@ app.get("/insights", async (req, res) => {
       console.log("[insights] GA fetch failed (continuing without):", gaErr.message);
     }
 
+    // Fetch Meta Ads data (may be null if not connected)
+    let metaAdsData = null;
+    if (tokenData.metaAdsToken && tokenData.metaAdAccountId) {
+      try {
+        metaAdsData = await fetchMetaAdsData(tokenData.metaAdsToken, tokenData.metaAdAccountId);
+      } catch (metaErr) {
+        console.log("[insights] Meta Ads fetch failed (continuing without):", metaErr.message);
+      }
+    }
+
     // Generate tile insights with Claude
-    const tiles = await generateTileInsights(shopifyStats, gaData);
+    const tiles = await generateTileInsights(shopifyStats, gaData, metaAdsData);
 
     res.json({
       shopifyStats,
       gaData,
+      metaAdsData,
       tiles,
     });
   } catch (err) {
@@ -969,10 +1070,18 @@ function buildDashboardHtml(storeName, shop, insightsData) {
   if (insightsData) {
     const stats = insightsData.shopifyStats;
     const ga = insightsData.gaData;
+    const meta = insightsData.metaAdsData;
     const updatedAt = new Date(insightsData.generatedAt);
     const timeStr = updatedAt.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
     const isToday = updatedAt.toDateString() === now.toDateString();
     const updatedLabel = isToday ? `Today at ${timeStr}` : updatedAt.toLocaleDateString("en-GB", { month: "short", day: "numeric" }) + ` at ${timeStr}`;
+
+    let metaFreshnessHtml;
+    if (meta) {
+      metaFreshnessHtml = `<span class="freshness-item connected-source">Meta Ads: \u00a3${meta.spend.toFixed(0)} spend, ${meta.clicks.toLocaleString()} clicks (${dateRange})</span>`;
+    } else {
+      metaFreshnessHtml = `<span class="freshness-item disconnected-source">Meta Ads: Not connected</span>`;
+    }
 
     freshnessHtml = `
       <div class="freshness">
@@ -982,7 +1091,7 @@ function buildDashboardHtml(storeName, shop, insightsData) {
             ? `<span class="freshness-item connected-source">Google Analytics: ${ga.sessions.toLocaleString()} sessions (${dateRange})</span>`
             : `<span class="freshness-item disconnected-source">Google Analytics: Not connected</span>`
           }
-          <span class="freshness-item disconnected-source">Meta Ads: Not connected</span>
+          ${metaFreshnessHtml}
         </div>
         <div class="freshness-meta">
           Last updated: ${escapeHtml(updatedLabel)} &middot; <a href="/dashboard?shop=${shopParam}&refresh=1" class="refresh-link">Refresh</a>
@@ -992,7 +1101,7 @@ function buildDashboardHtml(storeName, shop, insightsData) {
 
   // Get tiles
   const tiles = insightsData?.tiles;
-  const hasTiles = tiles && (tiles.healthCheck || tiles.biggestIssue || tiles.quickWin || tiles.opportunity);
+  const hasTiles = tiles && (tiles.healthCheck || tiles.biggestIssue || tiles.quickWin || tiles.opportunity || tiles.adPerformance);
 
   return `
     <!DOCTYPE html>
@@ -1049,6 +1158,8 @@ function buildDashboardHtml(storeName, shop, insightsData) {
         .tile-win .tile-label { color: #1e40af; }
         .tile-opp { background: linear-gradient(135deg, #fefce8 0%, #fef9c3 100%); border: 1px solid #fde68a; }
         .tile-opp .tile-label { color: #92400e; }
+        .tile-ads { background: linear-gradient(135deg, #ede9fe 0%, #f5f3ff 100%); border: 1px solid #c4b5fd; }
+        .tile-ads .tile-label { color: #5b21b6; }
 
         /* Error state */
         .insights-error { background: #fff; border-radius: 14px; padding: 40px; text-align: center; color: #6b7280; font-size: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
@@ -1110,6 +1221,13 @@ function buildDashboardHtml(storeName, shop, insightsData) {
             <div class="tile-label">\ud83c\udf1f Opportunity</div>
             <div class="tile-body">${formatTileHtml(tiles.opportunity)}</div>
           </div>
+
+          ${tiles.adPerformance ? `
+          <div class="tile tile-ads full">
+            <div class="tile-label">\ud83d\udcb0 Ad Performance</div>
+            <div class="tile-body">${formatTileHtml(tiles.adPerformance)}</div>
+          </div>
+          ` : ""}
 
         </div>
         `}
