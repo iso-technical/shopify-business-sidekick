@@ -600,6 +600,9 @@ app.get("/health", (_req, res) => {
 // --- Dashboard HTML builder ---
 
 function buildDashboardHtml(storeName, shop, products, orders) {
+  console.log("[dashboard-html] ANTHROPIC_API_KEY configured:", !!ANTHROPIC_API_KEY);
+  console.log("[dashboard-html] insights section will render:", !!ANTHROPIC_API_KEY);
+
   const productRows = products
     .map(
       (p) => `
@@ -676,6 +679,7 @@ function buildDashboardHtml(storeName, shop, products, orders) {
       </div>
       <div class="connected">Connected to: <strong>${escapeHtml(storeName)}</strong> (${escapeHtml(shop)})</div>
       <div class="container">
+        <!-- ANTHROPIC_API_KEY configured: ${ANTHROPIC_API_KEY ? "YES" : "NO"} -->
         ${ANTHROPIC_API_KEY ? `
         <div class="section">
           <h2>AI Insights <span class="insights-badge">Claude</span></h2>
@@ -683,24 +687,8 @@ function buildDashboardHtml(storeName, shop, products, orders) {
             <p class="insights-loading"><span class="spinner"></span>Analyzing your store data...</p>
           </div>
         </div>
-        <script>
-          fetch("/insights?shop=${encodeURIComponent(shop)}")
-            .then(r => r.json())
-            .then(data => {
-              const el = document.getElementById("insights");
-              if (data.error) {
-                el.innerHTML = '<p class="insights-error">' + data.error + '</p>';
-              } else if (data.insights) {
-                el.innerHTML = '<div class="insights-content">' + data.insights.replace(/</g, "&lt;").replace(/>/g, "&gt;") + '</div>';
-              } else {
-                el.innerHTML = '<p class="insights-error">No insights generated.</p>';
-              }
-            })
-            .catch(err => {
-              document.getElementById("insights").innerHTML = '<p class="insights-error">Failed to load insights.</p>';
-            });
-        </script>
         ` : ""}
+
         <div class="section">
           <h2>Recent Products</h2>
           ${
@@ -724,6 +712,38 @@ function buildDashboardHtml(storeName, shop, products, orders) {
           }
         </div>
       </div>
+      ${ANTHROPIC_API_KEY ? `
+      <script>
+        (function() {
+          var shop = ${JSON.stringify(shop)};
+          console.log("[insights-ui] Fetching insights for shop:", shop);
+          console.log("[insights-ui] insights element:", document.getElementById("insights"));
+          fetch("/insights?shop=" + encodeURIComponent(shop))
+            .then(function(r) {
+              console.log("[insights-ui] response status:", r.status);
+              return r.json();
+            })
+            .then(function(data) {
+              console.log("[insights-ui] data received:", Object.keys(data));
+              var el = document.getElementById("insights");
+              if (data.error) {
+                console.log("[insights-ui] error:", data.error);
+                el.innerHTML = '<p class="insights-error">' + data.error + '</p>';
+              } else if (data.insights) {
+                console.log("[insights-ui] insights length:", data.insights.length);
+                el.innerHTML = '<div class="insights-content">' + data.insights.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") + '</div>';
+              } else {
+                console.log("[insights-ui] no insights in response");
+                el.innerHTML = '<p class="insights-error">No insights generated.</p>';
+              }
+            })
+            .catch(function(err) {
+              console.error("[insights-ui] fetch failed:", err);
+              document.getElementById("insights").innerHTML = '<p class="insights-error">Failed to load insights.</p>';
+            });
+        })();
+      </script>
+      ` : ""}
     </body>
     </html>
   `;
