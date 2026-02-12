@@ -163,14 +163,12 @@ async function fetchGoogleAnalyticsData() {
     return null;
   }
 
-  console.log("[ga-auth] creating JWT auth...");
-  const auth = new google.auth.JWT(
-    serviceAccount.client_email,
-    null,
-    serviceAccount.private_key,
-    ["https://www.googleapis.com/auth/analytics.readonly"]
-  );
-  console.log("[ga-auth] JWT auth created successfully");
+  console.log("[ga-auth] creating GoogleAuth with credentials...");
+  const auth = new google.auth.GoogleAuth({
+    credentials: serviceAccount,
+    scopes: ["https://www.googleapis.com/auth/analytics.readonly"],
+  });
+  console.log("[ga-auth] GoogleAuth created successfully");
 
   const analyticsData = google.analyticsdata({ version: "v1beta", auth });
 
