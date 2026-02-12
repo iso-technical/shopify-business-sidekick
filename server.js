@@ -241,7 +241,7 @@ async function fetchGoogleAnalyticsData() {
   return metrics;
 }
 
-async function generateInsights(shopifyStats, gaData) {
+async function generateTileInsights(shopifyStats, gaData) {
   if (!ANTHROPIC_API_KEY) {
     console.log("[insights] ANTHROPIC_API_KEY not set");
     return null;
@@ -250,46 +250,76 @@ async function generateInsights(shopifyStats, gaData) {
   const Anthropic = require("@anthropic-ai/sdk");
   const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
-  let dataPrompt = `You're a trusted e-commerce advisor speaking directly to a store owner.\nData from the last 30 days:\n\n`;
-
-  dataPrompt += `Orders: ${shopifyStats.orderCount.toLocaleString()} (exact count)\n`;
-  dataPrompt += `Average order value: \u00a3${shopifyStats.avgOrderValue.toFixed(2)} (based on ${shopifyStats.sampleSize} order sample)\n`;
+  // Build shared data context
+  let dataContext = `Store data from the last 30 days:\n`;
+  dataContext += `Orders: ${shopifyStats.orderCount.toLocaleString()} (exact count)\n`;
+  dataContext += `Average order value: \u00a3${shopifyStats.avgOrderValue.toFixed(2)} (based on ${shopifyStats.sampleSize} order sample)\n`;
   if (shopifyStats.revenueIsEstimated) {
-    dataPrompt += `Estimated revenue: ~\u00a3${shopifyStats.revenue.toFixed(2)} (AOV \u00d7 order count)\n`;
+    dataContext += `Estimated revenue: ~\u00a3${shopifyStats.revenue.toFixed(2)} (AOV \u00d7 order count)\n`;
   } else {
-    dataPrompt += `Revenue: \u00a3${shopifyStats.revenue.toFixed(2)}\n`;
+    dataContext += `Revenue: \u00a3${shopifyStats.revenue.toFixed(2)}\n`;
   }
 
   if (gaData) {
-    dataPrompt += `Website sessions: ${gaData.sessions.toLocaleString()}\n`;
-    dataPrompt += `Bounce rate: ${(gaData.bounceRate * 100).toFixed(1)}%\n`;
-    dataPrompt += `Unique visitors: ${gaData.users.toLocaleString()}\n`;
+    dataContext += `Website sessions: ${gaData.sessions.toLocaleString()}\n`;
+    dataContext += `Bounce rate: ${(gaData.bounceRate * 100).toFixed(1)}%\n`;
+    dataContext += `Unique visitors: ${gaData.users.toLocaleString()}\n`;
+    dataContext += `Page views: ${gaData.pageViews.toLocaleString()}\n`;
   } else {
-    dataPrompt += `Website analytics: Not connected\n`;
+    dataContext += `Website analytics: Not connected\n`;
   }
 
-  dataPrompt += `\nIMPORTANT: Do NOT calculate conversion rate (orders \u00f7 sessions) — the data sources aren't linked and the result would be misleading. Focus on the metrics you have.\n`;
-  dataPrompt += `If revenue is marked as estimated, mention that briefly.\n\n`;
-  dataPrompt += `Respond in a conversational tone (like texting a knowledgeable friend, not writing a consultant report):\n`;
-  dataPrompt += `**Status:** One line — is the business healthy, struggling, or thriving?\n`;
-  dataPrompt += `**The Main Issue:** What's the biggest problem hurting performance right now? Be specific.\n`;
-  dataPrompt += `**Why It Matters:** Show the financial impact in real \u00a3 numbers.\n`;
-  dataPrompt += `**Quick Win:** One thing they can do THIS WEEK to improve. Be specific and actionable.\n`;
-  dataPrompt += `**Bigger Opportunity:** One 30-day goal that could significantly move the needle.\n\n`;
-  dataPrompt += `Keep it under 200 words total. Use "you" and "your". Be direct and helpful, not formal.\n`;
-  dataPrompt += `Use the exact section headers above (Status, The Main Issue, Why It Matters, Quick Win, Bigger Opportunity) with ** markdown bold.`;
+  const prompt = `You're a sharp e-commerce advisor texting a store owner. Casual, direct, helpful.
 
-  console.log("[insights] sending data to Claude...");
+${dataContext}
+RULES:
+- Do NOT calculate conversion rate (orders \u00f7 sessions) \u2014 the data sources aren't linked
+- Use \u00a3 for currency. If revenue is estimated, note it with a ~ prefix
+- Use "you" and "your". Be specific, not generic. Every word should help make a decision
+- Use emoji naturally but don't overdo it
+
+Respond with EXACTLY these 4 sections using ### headers:
+
+### HEALTH CHECK
+Status emoji (use exactly one: \ud83d\udfe2 healthy, \ud83d\udfe1 needs attention, or \ud83d\udd34 critical) then a one-line verdict.
+Then on new lines show 3 key metrics with context: Revenue, Orders, AOV. Format each as "Label: \u00a3X,XXX" with a brief note. 50 words max total.
+
+### BIGGEST ISSUE
+What's costing the most money right now? State the specific problem, the \u00a3 impact, and what to fix. Be blunt. 40 words max.
+
+### QUICK WIN
+One specific action for THIS WEEK. What to do, where to do it, and the expected impact. 30 words max.
+
+### OPPORTUNITY
+One growth pattern you spot in the data. Specific recommendation with realistic \u00a3 potential over 30 days. 40 words max.`;
+
+  console.log("[insights] sending tile prompt to Claude...");
 
   const message = await client.messages.create({
     model: "claude-sonnet-4-5-20250929",
-    max_tokens: 512,
-    messages: [{ role: "user", content: dataPrompt }],
+    max_tokens: 600,
+    messages: [{ role: "user", content: prompt }],
   });
 
   const text = message.content[0]?.text || "";
-  console.log("[insights] received response, length:", text.length);
-  return text;
+  console.log("[insights] received tile response, length:", text.length);
+
+  // Parse into 4 tiles by splitting on ### headers
+  const tiles = { healthCheck: "", biggestIssue: "", quickWin: "", opportunity: "" };
+  const sections = text.split(/###\s*/);
+  for (const section of sections) {
+    const trimmed = section.trim();
+    if (!trimmed) continue;
+    const firstLine = trimmed.split("\n")[0].toUpperCase();
+    const body = trimmed.replace(/^[^\n]+\n/, "").trim();
+    if (firstLine.includes("HEALTH")) tiles.healthCheck = body;
+    else if (firstLine.includes("ISSUE")) tiles.biggestIssue = body;
+    else if (firstLine.includes("QUICK") || firstLine.includes("WIN")) tiles.quickWin = body;
+    else if (firstLine.includes("OPPORTUN")) tiles.opportunity = body;
+  }
+
+  console.log("[insights] parsed tiles:", Object.keys(tiles).map(k => `${k}: ${tiles[k].length} chars`));
+  return tiles;
 }
 
 // --- Routes ---
@@ -485,7 +515,7 @@ app.get("/auth/callback", async (req, res) => {
   }
 });
 
-// Dashboard — show store info, products, orders
+// Dashboard — 4-tile insights view
 app.get("/dashboard", async (req, res) => {
   const shop = req.query.shop;
   const tokenData = shop ? getShopToken(shop) : null;
@@ -501,16 +531,8 @@ app.get("/dashboard", async (req, res) => {
 
   try {
     console.log("[dashboard] fetching data for shop:", shop);
-    const [shopData, productsData, ordersData] = await Promise.all([
-      shopifyFetch(shop, accessToken, "shop"),
-      shopifyFetch(shop, accessToken, "products?limit=5"),
-      shopifyFetch(shop, accessToken, "orders?limit=5&status=any"),
-    ]);
-    console.log("[dashboard] all 3 API calls succeeded");
-
+    const shopData = await shopifyFetch(shop, accessToken, "shop");
     const storeName = shopData.shop.name;
-    const products = productsData.products || [];
-    const orders = ordersData.orders || [];
 
     // Generate AI insights server-side (with 24hr cache)
     let insightsData = null;
@@ -530,7 +552,6 @@ app.get("/dashboard", async (req, res) => {
         try {
           console.log("[dashboard] generating fresh insights...");
 
-          // Fetch last 30 days of orders for stats
           const thirtyDaysAgo = new Date();
           thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
           const sinceDate = thirtyDaysAgo.toISOString();
@@ -554,8 +575,6 @@ app.get("/dashboard", async (req, res) => {
           const sampleSize = sampleOrders.length;
           const sampleRevenue = sampleOrders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
           const avgOrderValue = sampleSize > 0 ? sampleRevenue / sampleSize : 0;
-
-          // Revenue: exact if we have all orders, estimated if sample < total
           const revenueIsEstimated = sampleSize < orderCount;
           const revenue = revenueIsEstimated ? avgOrderValue * orderCount : sampleRevenue;
 
@@ -563,7 +582,6 @@ app.get("/dashboard", async (req, res) => {
 
           const shopifyStats = { orderCount, revenue, avgOrderValue, sampleSize, revenueIsEstimated };
 
-          // Fetch GA data (may be null if not configured)
           let gaData = null;
           try {
             gaData = await fetchGoogleAnalyticsData();
@@ -571,12 +589,10 @@ app.get("/dashboard", async (req, res) => {
             console.log("[dashboard] GA fetch failed (continuing without):", gaErr.message);
           }
 
-          const insights = await generateInsights(shopifyStats, gaData);
-          console.log("[dashboard] insights generated, length:", insights?.length || 0);
+          const tiles = await generateTileInsights(shopifyStats, gaData);
 
-          insightsData = { insights, shopifyStats, gaData };
+          insightsData = { tiles, shopifyStats, gaData };
           setCachedInsights(shop, insightsData);
-          // Re-read to get the generatedAt timestamp
           insightsData = getCachedInsights(shop);
         } catch (insightsErr) {
           console.error("[dashboard] insights generation failed:", insightsErr.message);
@@ -585,7 +601,7 @@ app.get("/dashboard", async (req, res) => {
       }
     }
 
-    res.send(buildDashboardHtml(storeName, shop, products, orders, insightsData));
+    res.send(buildDashboardHtml(storeName, shop, insightsData));
   } catch (err) {
     console.error("Dashboard error:", err);
     if (err.message.includes("401")) {
@@ -661,13 +677,13 @@ app.get("/insights", async (req, res) => {
       console.log("[insights] GA fetch failed (continuing without):", gaErr.message);
     }
 
-    // Generate insights with Claude
-    const insights = await generateInsights(shopifyStats, gaData);
+    // Generate tile insights with Claude
+    const tiles = await generateTileInsights(shopifyStats, gaData);
 
     res.json({
       shopifyStats,
       gaData,
-      insights,
+      tiles,
     });
   } catch (err) {
     console.error("[insights] error:", err);
@@ -721,35 +737,15 @@ app.get("/health", (_req, res) => {
 
 // --- Dashboard HTML builder ---
 
-function buildDashboardHtml(storeName, shop, products, orders, insightsData) {
+function formatTileHtml(text) {
+  if (!text) return "";
+  return escapeHtml(text)
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\n/g, "<br>");
+}
 
-  const productRows = products
-    .map(
-      (p) => `
-      <tr>
-        <td>${escapeHtml(p.title)}</td>
-        <td>${p.status}</td>
-        <td>${p.variants?.[0]?.price || "N/A"}</td>
-        <td>${p.variants?.[0]?.inventory_quantity ?? "N/A"}</td>
-      </tr>`
-    )
-    .join("");
-
-  const orderRows = orders
-    .map(
-      (o) => `
-      <tr>
-        <td>${escapeHtml(o.name)}</td>
-        <td>${new Date(o.created_at).toLocaleDateString()}</td>
-        <td>${o.financial_status}</td>
-        <td>${o.currency} ${o.total_price}</td>
-      </tr>`
-    )
-    .join("");
-
-  // Data freshness indicators
+function buildDashboardHtml(storeName, shop, insightsData) {
   const shopParam = encodeURIComponent(shop);
-  const gaConfigured = !!(GA_PROPERTY_ID && GA_SERVICE_ACCOUNT_JSON);
   const now = new Date();
   const thirtyDaysAgo = new Date(now);
   thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
@@ -757,6 +753,7 @@ function buildDashboardHtml(storeName, shop, products, orders, insightsData) {
   const dateTo = now.toLocaleDateString("en-GB", { month: "short", day: "numeric", year: "numeric" });
   const dateRange = `${dateFrom} - ${dateTo}`;
 
+  // Data freshness bar
   let freshnessHtml = "";
   if (insightsData) {
     const stats = insightsData.shopifyStats;
@@ -777,18 +774,14 @@ function buildDashboardHtml(storeName, shop, products, orders, insightsData) {
           <span class="freshness-item disconnected-source">Meta Ads: Not connected</span>
         </div>
         <div class="freshness-meta">
-          Last updated: ${escapeHtml(updatedLabel)}
+          Last updated: ${escapeHtml(updatedLabel)} &middot; <a href="/dashboard?shop=${shopParam}&refresh=1" class="refresh-link">Refresh</a>
         </div>
       </div>`;
   }
 
-  // Format insights text — convert **bold** to <strong> and preserve line breaks
-  let insightsHtml = "";
-  if (insightsData && insightsData.insights) {
-    insightsHtml = escapeHtml(insightsData.insights)
-      .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-      .replace(/\n/g, "<br>");
-  }
+  // Get tiles
+  const tiles = insightsData?.tiles;
+  const hasTiles = tiles && (tiles.healthCheck || tiles.biggestIssue || tiles.quickWin || tiles.opportunity);
 
   return `
     <!DOCTYPE html>
@@ -814,42 +807,51 @@ function buildDashboardHtml(storeName, shop, products, orders, insightsData) {
         .topbar a { color: #b5b5b5; text-decoration: none; font-size: 14px; }
         .topbar a:hover { color: #fff; }
         .topbar a.active { color: #fff; }
-        .connected { background: #008060; color: #fff; padding: 14px 32px; font-size: 15px; }
-        .connected strong { font-weight: 600; }
-        .container { max-width: 960px; margin: 32px auto; padding: 0 24px; }
+        .connected-bar { background: #008060; color: #fff; padding: 14px 32px; font-size: 15px; }
+        .connected-bar strong { font-weight: 600; }
+        .container { max-width: 960px; margin: 24px auto; padding: 0 24px; }
 
-        /* Insights hero section */
-        .insights-section { background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 50%, #f0f9ff 100%); border: 1px solid #d1fae5; border-radius: 16px; padding: 32px; margin-bottom: 28px; }
-        .insights-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
-        .insights-title { font-size: 20px; font-weight: 600; color: #1a1a1a; }
-        .insights-body { font-size: 15px; line-height: 1.8; color: #374151; }
-        .insights-body strong { color: #1a1a1a; font-weight: 600; }
-        .insights-body br + br { display: block; content: ""; margin-top: 4px; }
-        .insights-error { color: #b91c1c; font-size: 15px; }
-        .insights-footer { display: flex; align-items: center; justify-content: flex-end; margin-top: 20px; padding-top: 16px; border-top: 1px solid #d1fae5; }
-        .btn-refresh { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; background: #fff; color: #374151; border: 1px solid #d1d5db; border-radius: 8px; font-size: 13px; font-weight: 500; cursor: pointer; text-decoration: none; transition: all 0.15s; }
-        .btn-refresh:hover { background: #f9fafb; border-color: #9ca3af; }
-
-        /* Data freshness */
-        .freshness { margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid #d1fae5; }
+        /* Freshness bar */
+        .freshness { background: #fff; border-radius: 12px; padding: 16px 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
         .freshness-sources { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
         .freshness-item { font-size: 12px; padding: 4px 10px; border-radius: 6px; font-weight: 500; }
         .connected-source { background: #dcfce7; color: #166534; }
         .disconnected-source { background: #f3f4f6; color: #6b7280; }
         .freshness-meta { font-size: 12px; color: #6b7280; }
+        .refresh-link { color: #008060; text-decoration: none; font-weight: 500; }
+        .refresh-link:hover { text-decoration: underline; }
 
-        /* Collapsible tables */
-        .section { background: #fff; border-radius: 12px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-        .section summary { padding: 18px 24px; font-size: 15px; font-weight: 600; color: #333; cursor: pointer; list-style: none; display: flex; align-items: center; justify-content: space-between; }
-        .section summary::-webkit-details-marker { display: none; }
-        .section summary::after { content: "\\25B8"; color: #9ca3af; font-size: 14px; transition: transform 0.2s; }
-        .section[open] summary::after { transform: rotate(90deg); }
-        .section .section-body { padding: 0 24px 24px; }
-        .section .count-badge { font-size: 12px; font-weight: 500; color: #6b7280; background: #f3f4f6; padding: 2px 8px; border-radius: 10px; margin-left: 8px; }
-        table { width: 100%; border-collapse: collapse; font-size: 14px; }
-        th { text-align: left; padding: 10px 12px; border-bottom: 2px solid #e1e3e5; color: #6b7177; font-weight: 500; font-size: 13px; }
-        td { padding: 10px 12px; border-bottom: 1px solid #f1f1f1; }
-        .empty { color: #999; font-style: italic; padding: 16px 0; }
+        /* Tile grid */
+        .tile-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+        .tile { border-radius: 14px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+        .tile.full { grid-column: 1 / -1; }
+        .tile-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; }
+        .tile-body { font-size: 15px; line-height: 1.7; color: #374151; }
+        .tile-body strong { color: #1a1a1a; font-weight: 600; }
+
+        /* Tile colors */
+        .tile-health { background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%); border: 1px solid #bbf7d0; }
+        .tile-health .tile-label { color: #166534; }
+        .tile-issue { background: linear-gradient(135deg, #fef2f2 0%, #fff1f2 100%); border: 1px solid #fecaca; }
+        .tile-issue .tile-label { color: #991b1b; }
+        .tile-win { background: linear-gradient(135deg, #eff6ff 0%, #f0f9ff 100%); border: 1px solid #bfdbfe; }
+        .tile-win .tile-label { color: #1e40af; }
+        .tile-opp { background: linear-gradient(135deg, #fefce8 0%, #fef9c3 100%); border: 1px solid #fde68a; }
+        .tile-opp .tile-label { color: #92400e; }
+
+        /* Error state */
+        .insights-error { background: #fff; border-radius: 14px; padding: 40px; text-align: center; color: #6b7280; font-size: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+        .insights-error a { color: #008060; text-decoration: none; font-weight: 500; }
+
+        /* No API key state */
+        .setup-card { background: #fff; border-radius: 14px; padding: 48px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+        .setup-card h2 { font-size: 18px; margin-bottom: 8px; }
+        .setup-card p { color: #6b7280; font-size: 14px; line-height: 1.6; }
+
+        @media (max-width: 640px) {
+          .tile-grid { grid-template-columns: 1fr; }
+          .tile.full { grid-column: 1; }
+        }
       </style>
     </head>
     <body>
@@ -861,54 +863,45 @@ function buildDashboardHtml(storeName, shop, products, orders, insightsData) {
           <a href="/disconnect?shop=${shopParam}">Disconnect</a>
         </nav>
       </div>
-      <div class="connected">Connected to: <strong>${escapeHtml(storeName)}</strong> (${escapeHtml(shop)})</div>
+      <div class="connected-bar">Connected to: <strong>${escapeHtml(storeName)}</strong> (${escapeHtml(shop)})</div>
       <div class="container">
 
-        ${ANTHROPIC_API_KEY ? `
-        <div class="insights-section">
-          <div class="insights-header">
-            <div class="insights-title">Your Store Insights</div>
-          </div>
-          ${freshnessHtml}
-          <div id="insights">
-            ${insightsHtml
-              ? `<div class="insights-body">${insightsHtml}</div>`
-              : '<p class="insights-error">Unable to generate insights. Check your API key and try refreshing.</p>'
-            }
-          </div>
-          <div class="insights-footer">
-            <a class="btn-refresh" href="/dashboard?shop=${shopParam}&refresh=1">Refresh insights</a>
-          </div>
+        ${freshnessHtml}
+
+        ${!ANTHROPIC_API_KEY ? `
+        <div class="setup-card">
+          <h2>Add your Anthropic API key to get started</h2>
+          <p>Set ANTHROPIC_API_KEY in your environment variables to enable AI-powered store insights.</p>
         </div>
-        ` : ""}
+        ` : !hasTiles ? `
+        <div class="insights-error">
+          Unable to generate insights. <a href="/dashboard?shop=${shopParam}&refresh=1">Try again</a>
+        </div>
+        ` : `
+        <div class="tile-grid">
 
-        <details class="section" open>
-          <summary>Recent Products <span class="count-badge">${products.length}</span></summary>
-          <div class="section-body">
-          ${
-            products.length
-              ? `<table>
-                  <thead><tr><th>Title</th><th>Status</th><th>Price</th><th>Inventory</th></tr></thead>
-                  <tbody>${productRows}</tbody>
-                </table>`
-              : '<p class="empty">No products found.</p>'
-          }
+          <div class="tile tile-health full">
+            <div class="tile-label">\ud83c\udfe5 Health Check</div>
+            <div class="tile-body">${formatTileHtml(tiles.healthCheck)}</div>
           </div>
-        </details>
 
-        <details class="section">
-          <summary>Recent Orders <span class="count-badge">${orders.length}</span></summary>
-          <div class="section-body">
-          ${
-            orders.length
-              ? `<table>
-                  <thead><tr><th>Order</th><th>Date</th><th>Status</th><th>Total</th></tr></thead>
-                  <tbody>${orderRows}</tbody>
-                </table>`
-              : '<p class="empty">No orders found.</p>'
-          }
+          <div class="tile tile-issue">
+            <div class="tile-label">\ud83d\udea8 Biggest Issue</div>
+            <div class="tile-body">${formatTileHtml(tiles.biggestIssue)}</div>
           </div>
-        </details>
+
+          <div class="tile tile-win">
+            <div class="tile-label">\u26a1 Quick Win</div>
+            <div class="tile-body">${formatTileHtml(tiles.quickWin)}</div>
+          </div>
+
+          <div class="tile tile-opp full">
+            <div class="tile-label">\ud83c\udf1f Opportunity</div>
+            <div class="tile-body">${formatTileHtml(tiles.opportunity)}</div>
+          </div>
+
+        </div>
+        `}
 
       </div>
     </body>
