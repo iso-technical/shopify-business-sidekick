@@ -138,8 +138,12 @@ async function shopifyFetch(shop, accessToken, endpoint) {
 }
 
 async function fetchGoogleAnalyticsData() {
+  console.log("[ga-auth] GA_PROPERTY_ID:", GA_PROPERTY_ID || "(not set)");
+  console.log("[ga-auth] GA_SERVICE_ACCOUNT_JSON exists:", !!GA_SERVICE_ACCOUNT_JSON);
+  console.log("[ga-auth] GA_SERVICE_ACCOUNT_JSON length:", GA_SERVICE_ACCOUNT_JSON?.length || 0);
+
   if (!GA_PROPERTY_ID || !GA_SERVICE_ACCOUNT_JSON) {
-    console.log("[ga] missing config — GA_PROPERTY_ID or GA_SERVICE_ACCOUNT_JSON");
+    console.log("[ga-auth] aborting — missing config");
     return null;
   }
 
@@ -148,17 +152,25 @@ async function fetchGoogleAnalyticsData() {
   let serviceAccount;
   try {
     serviceAccount = JSON.parse(GA_SERVICE_ACCOUNT_JSON);
+    console.log("[ga-auth] parsed JSON successfully");
+    console.log("[ga-auth] client_email:", serviceAccount.client_email || "(missing)");
+    console.log("[ga-auth] private_key present:", !!serviceAccount.private_key);
+    console.log("[ga-auth] private_key length:", serviceAccount.private_key?.length || 0);
+    console.log("[ga-auth] project_id:", serviceAccount.project_id || "(missing)");
   } catch (err) {
-    console.error("[ga] failed to parse GA_SERVICE_ACCOUNT_JSON:", err.message);
+    console.error("[ga-auth] failed to parse GA_SERVICE_ACCOUNT_JSON:", err.message);
+    console.error("[ga-auth] first 100 chars:", GA_SERVICE_ACCOUNT_JSON.substring(0, 100));
     return null;
   }
 
+  console.log("[ga-auth] creating JWT auth...");
   const auth = new google.auth.JWT(
     serviceAccount.client_email,
     null,
     serviceAccount.private_key,
     ["https://www.googleapis.com/auth/analytics.readonly"]
   );
+  console.log("[ga-auth] JWT auth created successfully");
 
   const analyticsData = google.analyticsdata({ version: "v1beta", auth });
 
