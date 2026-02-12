@@ -11,6 +11,8 @@ const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
 const SCOPES = "read_products,read_orders";
 const HOST = process.env.HOST; // e.g. https://your-app.up.railway.app
 const APP_HANDLE = process.env.APP_HANDLE || "mr-bean";
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 
 if (!SHOPIFY_API_KEY || !SHOPIFY_API_SECRET) {
   console.error("Missing SHOPIFY_API_KEY or SHOPIFY_API_SECRET env vars");
@@ -27,7 +29,13 @@ function getShopToken(shop) {
 }
 
 function setShopToken(shop, accessToken) {
-  shopTokens[shop] = { accessToken, installedAt: Date.now() };
+  const existing = shopTokens[shop];
+  shopTokens[shop] = {
+    accessToken,
+    installedAt: Date.now(),
+    metaAdsToken: existing?.metaAdsToken || null,
+    googleAnalyticsToken: existing?.googleAnalyticsToken || null,
+  };
   console.log("[store] saved token for", shop);
 }
 
@@ -372,6 +380,130 @@ app.get("/disconnect", (req, res) => {
   });
 });
 
+// Google Analytics OAuth — Step 1: Redirect to Google consent screen
+app.get("/connect/google-analytics", (req, res) => {
+  const shop = req.query.shop;
+  if (!shop || !getShopToken(shop)) {
+    return res.redirect("/install");
+  }
+
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+    console.error("[google] Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET");
+    return res.status(500).send("Google Analytics is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.");
+  }
+
+  const state = generateNonce();
+  req.session.gaState = state;
+  req.session.gaShop = shop;
+
+  const redirectUri = `${HOST}/connect/google-analytics/callback`;
+  const authUrl =
+    `https://accounts.google.com/o/oauth2/v2/auth` +
+    `?client_id=${encodeURIComponent(GOOGLE_CLIENT_ID)}` +
+    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+    `&response_type=code` +
+    `&scope=${encodeURIComponent("https://www.googleapis.com/auth/analytics.readonly")}` +
+    `&access_type=offline` +
+    `&prompt=consent` +
+    `&state=${state}`;
+
+  console.log("[google] redirecting to Google OAuth for shop:", shop);
+  res.setHeader("X-Frame-Options", "DENY");
+  res.redirect(authUrl);
+});
+
+// Google Analytics OAuth — Step 2: Handle callback
+app.get("/connect/google-analytics/callback", async (req, res) => {
+  const { code, state, error } = req.query;
+  const shop = req.session.gaShop;
+  const expectedState = req.session.gaState;
+
+  console.log("[google-callback] shop:", shop);
+  console.log("[google-callback] state from query:", state);
+  console.log("[google-callback] state from session:", expectedState);
+
+  if (error) {
+    console.log("[google-callback] user denied or error:", error);
+    return res.redirect(`/settings?shop=${encodeURIComponent(shop || "")}`);
+  }
+
+  if (!state || state !== expectedState) {
+    console.log("[google-callback] STATE MISMATCH");
+    return res.status(403).send("State mismatch — possible CSRF attack.");
+  }
+
+  if (!shop || !getShopToken(shop)) {
+    console.log("[google-callback] no shop token found for:", shop);
+    return res.redirect("/install");
+  }
+
+  try {
+    const redirectUri = `${HOST}/connect/google-analytics/callback`;
+    const tokenBody = new URLSearchParams({
+      code,
+      client_id: GOOGLE_CLIENT_ID,
+      client_secret: GOOGLE_CLIENT_SECRET,
+      redirect_uri: redirectUri,
+      grant_type: "authorization_code",
+    });
+
+    console.log("[google-token] exchanging code for token...");
+
+    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: tokenBody.toString(),
+    });
+
+    const tokenText = await tokenRes.text();
+    console.log("[google-token] status:", tokenRes.status);
+    console.log("[google-token] response:", tokenText.substring(0, 300));
+
+    if (!tokenRes.ok) {
+      throw new Error(`Google token exchange failed (${tokenRes.status}): ${tokenText.substring(0, 200)}`);
+    }
+
+    const tokenData = JSON.parse(tokenText);
+
+    // Save Google Analytics token alongside existing shop data
+    const existing = shopTokens[shop];
+    existing.googleAnalyticsToken = {
+      accessToken: tokenData.access_token,
+      refreshToken: tokenData.refresh_token || null,
+      expiresAt: Date.now() + (tokenData.expires_in * 1000),
+    };
+    console.log("[google] saved GA token for", shop);
+
+    // Clean up session state
+    delete req.session.gaState;
+    delete req.session.gaShop;
+
+    // Redirect back to settings inside Shopify admin
+    const storeSlug = shop.replace(".myshopify.com", "");
+    const adminUrl = `https://admin.shopify.com/store/${storeSlug}/apps/${APP_HANDLE}`;
+    console.log("[google-callback] redirecting to:", adminUrl);
+    res.redirect(adminUrl);
+  } catch (err) {
+    console.error("[google-callback] error:", err);
+    res.status(500).send("Google Analytics connection failed. Check server logs.");
+  }
+});
+
+// Settings — data source connection status
+app.get("/settings", (req, res) => {
+  const shop = req.query.shop;
+  const tokenData = shop ? getShopToken(shop) : null;
+
+  if (!shop || !tokenData) {
+    if (shop) {
+      return res.redirect(`/install?shop=${encodeURIComponent(shop)}`);
+    }
+    return res.redirect("/install");
+  }
+
+  res.send(buildSettingsHtml(shop, tokenData));
+});
+
 // Health check for Railway
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
@@ -424,8 +556,10 @@ function buildDashboardHtml(storeName, shop, products, orders) {
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f6f6f7; color: #1a1a1a; }
         .topbar { background: #1a1a1a; color: #fff; padding: 16px 32px; display: flex; justify-content: space-between; align-items: center; }
         .topbar h1 { font-size: 18px; font-weight: 600; }
+        .topbar nav { display: flex; gap: 20px; }
         .topbar a { color: #b5b5b5; text-decoration: none; font-size: 14px; }
         .topbar a:hover { color: #fff; }
+        .topbar a.active { color: #fff; }
         .connected { background: #008060; color: #fff; padding: 14px 32px; font-size: 15px; }
         .connected strong { font-weight: 600; }
         .container { max-width: 960px; margin: 32px auto; padding: 0 24px; }
@@ -440,7 +574,11 @@ function buildDashboardHtml(storeName, shop, products, orders) {
     <body>
       <div class="topbar">
         <h1>Shopify Dashboard</h1>
-        <a href="/disconnect?shop=${encodeURIComponent(shop)}">Disconnect</a>
+        <nav>
+          <a href="/dashboard?shop=${encodeURIComponent(shop)}" class="active">Dashboard</a>
+          <a href="/settings?shop=${encodeURIComponent(shop)}">Settings</a>
+          <a href="/disconnect?shop=${encodeURIComponent(shop)}">Disconnect</a>
+        </nav>
       </div>
       <div class="connected">Connected to: <strong>${escapeHtml(storeName)}</strong> (${escapeHtml(shop)})</div>
       <div class="container">
@@ -465,6 +603,111 @@ function buildDashboardHtml(storeName, shop, products, orders) {
                 </table>`
               : '<p class="empty">No orders found.</p>'
           }
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+}
+
+function buildSettingsHtml(shop, tokenData) {
+  const shopParam = encodeURIComponent(shop);
+  const metaConnected = !!tokenData.metaAdsToken;
+  const gaConnected = !!tokenData.googleAnalyticsToken;
+
+  return `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Settings — Data Sources</title>
+      <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
+      <script>
+        shopify.config = {
+          apiKey: ${JSON.stringify(SHOPIFY_API_KEY)},
+          host: new URLSearchParams(window.location.search).get("host")
+            || btoa(${JSON.stringify(shop + "/admin")}),
+        };
+      </script>
+      <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f6f6f7; color: #1a1a1a; }
+        .topbar { background: #1a1a1a; color: #fff; padding: 16px 32px; display: flex; justify-content: space-between; align-items: center; }
+        .topbar h1 { font-size: 18px; font-weight: 600; }
+        .topbar nav { display: flex; gap: 20px; }
+        .topbar a { color: #b5b5b5; text-decoration: none; font-size: 14px; }
+        .topbar a:hover { color: #fff; }
+        .topbar a.active { color: #fff; }
+        .container { max-width: 960px; margin: 32px auto; padding: 0 24px; }
+        .section { background: #fff; border-radius: 12px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+        .section h2 { font-size: 16px; margin-bottom: 16px; color: #333; }
+        .source-row { display: flex; align-items: center; justify-content: space-between; padding: 16px 0; border-bottom: 1px solid #f1f1f1; }
+        .source-row:last-child { border-bottom: none; }
+        .source-info { display: flex; align-items: center; gap: 12px; }
+        .source-icon { width: 40px; height: 40px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 18px; }
+        .source-icon.shopify { background: #96bf48; color: #fff; }
+        .source-icon.meta { background: #1877f2; color: #fff; }
+        .source-icon.ga { background: #e37400; color: #fff; }
+        .source-name { font-size: 15px; font-weight: 500; }
+        .source-desc { font-size: 13px; color: #6b7177; margin-top: 2px; }
+        .status-connected { color: #008060; font-size: 14px; font-weight: 500; }
+        .btn-connect { display: inline-block; padding: 8px 20px; background: #008060; color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; text-decoration: none; }
+        .btn-connect:hover { background: #006e52; }
+      </style>
+    </head>
+    <body>
+      <div class="topbar">
+        <h1>Shopify Dashboard</h1>
+        <nav>
+          <a href="/dashboard?shop=${shopParam}">Dashboard</a>
+          <a href="/settings?shop=${shopParam}" class="active">Settings</a>
+          <a href="/disconnect?shop=${shopParam}">Disconnect</a>
+        </nav>
+      </div>
+      <div class="container">
+        <div class="section">
+          <h2>Data Sources</h2>
+
+          <div class="source-row">
+            <div class="source-info">
+              <div class="source-icon shopify">S</div>
+              <div>
+                <div class="source-name">Shopify</div>
+                <div class="source-desc">Orders, products, and store data</div>
+              </div>
+            </div>
+            <span class="status-connected">&#10003; Connected</span>
+          </div>
+
+          <div class="source-row">
+            <div class="source-info">
+              <div class="source-icon meta">f</div>
+              <div>
+                <div class="source-name">Meta Ads</div>
+                <div class="source-desc">Ad spend, impressions, and conversions</div>
+              </div>
+            </div>
+            ${metaConnected
+              ? '<span class="status-connected">&#10003; Connected</span>'
+              : `<a class="btn-connect" href="/connect/meta?shop=${shopParam}">Connect</a>`
+            }
+          </div>
+
+          <div class="source-row">
+            <div class="source-info">
+              <div class="source-icon ga">G</div>
+              <div>
+                <div class="source-name">Google Analytics</div>
+                <div class="source-desc">Traffic, sessions, and user behavior</div>
+              </div>
+            </div>
+            ${gaConnected
+              ? '<span class="status-connected">&#10003; Connected</span>'
+              : `<a class="btn-connect" href="/connect/google-analytics?shop=${shopParam}">Connect</a>`
+            }
+          </div>
+
         </div>
       </div>
     </body>
