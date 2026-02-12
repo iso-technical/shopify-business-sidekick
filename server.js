@@ -63,6 +63,7 @@ app.use(
 );
 
 app.use(express.json());
+app.use(express.static("public"));
 
 // Allow Shopify admin to frame this app
 app.use((req, res, next) => {
@@ -712,38 +713,7 @@ function buildDashboardHtml(storeName, shop, products, orders) {
           }
         </div>
       </div>
-      ${ANTHROPIC_API_KEY ? `
-      <script>
-        (function() {
-          var shop = ${JSON.stringify(shop)};
-          console.log("[insights-ui] Fetching insights for shop:", shop);
-          console.log("[insights-ui] insights element:", document.getElementById("insights"));
-          fetch("/insights?shop=" + encodeURIComponent(shop))
-            .then(function(r) {
-              console.log("[insights-ui] response status:", r.status);
-              return r.json();
-            })
-            .then(function(data) {
-              console.log("[insights-ui] data received:", Object.keys(data));
-              var el = document.getElementById("insights");
-              if (data.error) {
-                console.log("[insights-ui] error:", data.error);
-                el.innerHTML = '<p class="insights-error">' + data.error + '</p>';
-              } else if (data.insights) {
-                console.log("[insights-ui] insights length:", data.insights.length);
-                el.innerHTML = '<div class="insights-content">' + data.insights.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") + '</div>';
-              } else {
-                console.log("[insights-ui] no insights in response");
-                el.innerHTML = '<p class="insights-error">No insights generated.</p>';
-              }
-            })
-            .catch(function(err) {
-              console.error("[insights-ui] fetch failed:", err);
-              document.getElementById("insights").innerHTML = '<p class="insights-error">Failed to load insights.</p>';
-            });
-        })();
-      </script>
-      ` : ""}
+      ${ANTHROPIC_API_KEY ? `<script src="/dashboard.js" data-shop="${escapeHtml(shop)}"></script>` : ""}
     </body>
     </html>
   `;
