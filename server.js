@@ -17,6 +17,25 @@ if (!SHOPIFY_API_KEY || !SHOPIFY_API_SECRET) {
   process.exit(1);
 }
 
+// In-memory token store keyed by shop domain
+// Persists across standalone OAuth and embedded iframe requests
+// In production, replace with a database (Redis, PostgreSQL, etc.)
+const shopTokens = {};
+
+function getShopToken(shop) {
+  return shopTokens[shop] || null;
+}
+
+function setShopToken(shop, accessToken) {
+  shopTokens[shop] = { accessToken, installedAt: Date.now() };
+  console.log("[store] saved token for", shop);
+}
+
+function deleteShopToken(shop) {
+  delete shopTokens[shop];
+  console.log("[store] deleted token for", shop);
+}
+
 // Trust the reverse proxy (Railway, Heroku, etc.) so req.secure works
 // and Express sets Secure cookies behind HTTPS-terminating proxies
 if (process.env.NODE_ENV === "production") {
@@ -39,7 +58,7 @@ app.use(express.json());
 
 // Allow Shopify admin to frame this app
 app.use((req, res, next) => {
-  const shop = req.query.shop || req.session?.shop;
+  const shop = req.query.shop;
   if (shop) {
     res.setHeader(
       "Content-Security-Policy",
@@ -117,16 +136,9 @@ async function shopifyFetch(shop, accessToken, endpoint) {
 app.get("/", (req, res) => {
   const shop = req.query.shop;
 
-  // If already authenticated, go straight to dashboard
-  if (req.session.shop && req.session.accessToken) {
-    // If Shopify sent a different shop param, re-auth for that shop
-    if (shop && shop !== req.session.shop) {
-      req.session.destroy(() => {
-        res.redirect(`/auth?shop=${encodeURIComponent(shop)}`);
-      });
-      return;
-    }
-    return res.redirect("/dashboard");
+  // If shop param provided and token exists, go straight to dashboard
+  if (shop && getShopToken(shop)) {
+    return res.redirect(`/dashboard?shop=${encodeURIComponent(shop)}`);
   }
 
   // Shopify admin loads /?shop=store.myshopify.com in an iframe
@@ -174,12 +186,12 @@ app.get("/", (req, res) => {
 
 // OAuth landing page — runs in a normal browser tab, not embedded
 app.get("/install", (req, res) => {
-  // If already authenticated, skip straight to dashboard
-  if (req.session.shop && req.session.accessToken) {
-    return res.redirect("/dashboard");
-  }
-
   const shop = req.query.shop || "";
+
+  // If already authenticated, skip straight to dashboard
+  if (shop && getShopToken(shop)) {
+    return res.redirect(`/dashboard?shop=${encodeURIComponent(shop)}`);
+  }
   const error = req.query.error || "";
 
   // Prevent this page from loading inside an iframe
@@ -297,8 +309,8 @@ app.get("/auth/callback", async (req, res) => {
 
     const { access_token } = JSON.parse(tokenText);
 
-    req.session.shop = shop;
-    req.session.accessToken = access_token;
+    // Save token to in-memory store (works across standalone + embedded)
+    setShopToken(shop, access_token);
 
     // Redirect into Shopify admin so the app loads embedded
     const storeSlug = shop.replace(".myshopify.com", "");
@@ -313,15 +325,17 @@ app.get("/auth/callback", async (req, res) => {
 
 // Dashboard — show store info, products, orders
 app.get("/dashboard", async (req, res) => {
-  const { shop, accessToken, pendingShop } = req.session;
-  if (!shop || !accessToken) {
-    // Preserve shop context so /install can pre-fill the domain
-    const knownShop = req.query.shop || pendingShop;
-    if (knownShop) {
-      return res.redirect(`/install?shop=${encodeURIComponent(knownShop)}`);
+  const shop = req.query.shop;
+  const tokenData = shop ? getShopToken(shop) : null;
+
+  if (!shop || !tokenData) {
+    if (shop) {
+      return res.redirect(`/install?shop=${encodeURIComponent(shop)}`);
     }
     return res.redirect("/install");
   }
+
+  const { accessToken } = tokenData;
 
   try {
     console.log("[dashboard] fetching data for shop:", shop);
@@ -340,8 +354,8 @@ app.get("/dashboard", async (req, res) => {
   } catch (err) {
     console.error("Dashboard error:", err);
     if (err.message.includes("401")) {
-      req.session.destroy(() => {});
-      return res.redirect("/install?error=token_expired");
+      deleteShopToken(shop);
+      return res.redirect(`/install?shop=${encodeURIComponent(shop)}&error=token_expired`);
     }
     res.status(500).send("Failed to load dashboard. Check server logs.");
   }
@@ -349,8 +363,12 @@ app.get("/dashboard", async (req, res) => {
 
 // Disconnect
 app.get("/disconnect", (req, res) => {
+  const shop = req.query.shop;
+  if (shop) {
+    deleteShopToken(shop);
+  }
   req.session.destroy(() => {
-    res.redirect("/");
+    res.redirect("/install");
   });
 });
 
@@ -422,7 +440,7 @@ function buildDashboardHtml(storeName, shop, products, orders) {
     <body>
       <div class="topbar">
         <h1>Shopify Dashboard</h1>
-        <a href="/disconnect">Disconnect</a>
+        <a href="/disconnect?shop=${encodeURIComponent(shop)}">Disconnect</a>
       </div>
       <div class="connected">Connected to: <strong>${escapeHtml(storeName)}</strong> (${escapeHtml(shop)})</div>
       <div class="container">
