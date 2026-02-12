@@ -11,8 +11,9 @@ const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
 const SCOPES = "read_products,read_orders";
 const HOST = process.env.HOST; // e.g. https://your-app.up.railway.app
 const APP_HANDLE = process.env.APP_HANDLE || "mr-bean";
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const GA_PROPERTY_ID = process.env.GA_PROPERTY_ID;
+const GA_SERVICE_ACCOUNT_EMAIL = process.env.GA_SERVICE_ACCOUNT_EMAIL;
+const GA_PRIVATE_KEY = process.env.GA_PRIVATE_KEY?.replace(/\\n/g, "\n");
 
 if (!SHOPIFY_API_KEY || !SHOPIFY_API_SECRET) {
   console.error("Missing SHOPIFY_API_KEY or SHOPIFY_API_SECRET env vars");
@@ -34,7 +35,6 @@ function setShopToken(shop, accessToken) {
     accessToken,
     installedAt: Date.now(),
     metaAdsToken: existing?.metaAdsToken || null,
-    googleAnalyticsToken: existing?.googleAnalyticsToken || null,
   };
   console.log("[store] saved token for", shop);
 }
@@ -136,6 +136,62 @@ async function shopifyFetch(shop, accessToken, endpoint) {
   }
 
   return res.json();
+}
+
+async function fetchGoogleAnalyticsData() {
+  if (!GA_PROPERTY_ID || !GA_SERVICE_ACCOUNT_EMAIL || !GA_PRIVATE_KEY) {
+    console.log("[ga] missing config — GA_PROPERTY_ID, GA_SERVICE_ACCOUNT_EMAIL, or GA_PRIVATE_KEY");
+    return null;
+  }
+
+  const { google } = require("googleapis");
+
+  const auth = new google.auth.JWT(
+    GA_SERVICE_ACCOUNT_EMAIL,
+    null,
+    GA_PRIVATE_KEY,
+    ["https://www.googleapis.com/auth/analytics.readonly"]
+  );
+
+  const analyticsData = google.analyticsdata({ version: "v1beta", auth });
+
+  const today = new Date();
+  const thirtyDaysAgo = new Date(today);
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+  const formatDate = (d) => d.toISOString().split("T")[0];
+
+  console.log("[ga] fetching data for property:", GA_PROPERTY_ID);
+  console.log("[ga] date range:", formatDate(thirtyDaysAgo), "to", formatDate(today));
+
+  const res = await analyticsData.properties.runReport({
+    property: `properties/${GA_PROPERTY_ID}`,
+    requestBody: {
+      dateRanges: [{ startDate: formatDate(thirtyDaysAgo), endDate: formatDate(today) }],
+      metrics: [
+        { name: "sessions" },
+        { name: "screenPageViews" },
+        { name: "activeUsers" },
+        { name: "bounceRate" },
+      ],
+    },
+  });
+
+  const row = res.data.rows?.[0];
+  if (!row) {
+    console.log("[ga] no data returned");
+    return { sessions: 0, pageViews: 0, users: 0, bounceRate: 0 };
+  }
+
+  const metrics = {
+    sessions: parseInt(row.metricValues[0].value, 10),
+    pageViews: parseInt(row.metricValues[1].value, 10),
+    users: parseInt(row.metricValues[2].value, 10),
+    bounceRate: parseFloat(row.metricValues[3].value),
+  };
+
+  console.log("[ga] data:", metrics);
+  return metrics;
 }
 
 // --- Routes ---
@@ -380,112 +436,27 @@ app.get("/disconnect", (req, res) => {
   });
 });
 
-// Google Analytics OAuth — Step 1: Redirect to Google consent screen
-app.get("/connect/google-analytics", (req, res) => {
-  const shop = req.query.shop;
-  if (!shop || !getShopToken(shop)) {
-    return res.redirect("/install");
-  }
-
-  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
-    console.error("[google] Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET");
-    return res.status(500).send("Google Analytics is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.");
-  }
-
-  const state = generateNonce();
-  req.session.gaState = state;
-  req.session.gaShop = shop;
-
-  const redirectUri = `${HOST}/connect/google-analytics/callback`;
-  const authUrl =
-    `https://accounts.google.com/o/oauth2/v2/auth` +
-    `?client_id=${encodeURIComponent(GOOGLE_CLIENT_ID)}` +
-    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-    `&response_type=code` +
-    `&scope=${encodeURIComponent("https://www.googleapis.com/auth/analytics.readonly")}` +
-    `&access_type=offline` +
-    `&prompt=consent` +
-    `&state=${state}`;
-
-  console.log("[google] redirecting to Google OAuth for shop:", shop);
-  res.setHeader("X-Frame-Options", "DENY");
-  res.redirect(authUrl);
-});
-
-// Google Analytics OAuth — Step 2: Handle callback
-app.get("/connect/google-analytics/callback", async (req, res) => {
-  const { code, state, error } = req.query;
-  const shop = req.session.gaShop;
-  const expectedState = req.session.gaState;
-
-  console.log("[google-callback] shop:", shop);
-  console.log("[google-callback] state from query:", state);
-  console.log("[google-callback] state from session:", expectedState);
-
-  if (error) {
-    console.log("[google-callback] user denied or error:", error);
-    return res.redirect(`/settings?shop=${encodeURIComponent(shop || "")}`);
-  }
-
-  if (!state || state !== expectedState) {
-    console.log("[google-callback] STATE MISMATCH");
-    return res.status(403).send("State mismatch — possible CSRF attack.");
-  }
-
-  if (!shop || !getShopToken(shop)) {
-    console.log("[google-callback] no shop token found for:", shop);
-    return res.redirect("/install");
-  }
-
+// Test Google Analytics — verify service account connection
+app.get("/test-ga", async (_req, res) => {
   try {
-    const redirectUri = `${HOST}/connect/google-analytics/callback`;
-    const tokenBody = new URLSearchParams({
-      code,
-      client_id: GOOGLE_CLIENT_ID,
-      client_secret: GOOGLE_CLIENT_SECRET,
-      redirect_uri: redirectUri,
-      grant_type: "authorization_code",
-    });
-
-    console.log("[google-token] exchanging code for token...");
-
-    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: tokenBody.toString(),
-    });
-
-    const tokenText = await tokenRes.text();
-    console.log("[google-token] status:", tokenRes.status);
-    console.log("[google-token] response:", tokenText.substring(0, 300));
-
-    if (!tokenRes.ok) {
-      throw new Error(`Google token exchange failed (${tokenRes.status}): ${tokenText.substring(0, 200)}`);
+    const data = await fetchGoogleAnalyticsData();
+    if (!data) {
+      return res.status(500).send(
+        "Google Analytics not configured. Set GA_PROPERTY_ID, GA_SERVICE_ACCOUNT_EMAIL, and GA_PRIVATE_KEY in .env"
+      );
     }
-
-    const tokenData = JSON.parse(tokenText);
-
-    // Save Google Analytics token alongside existing shop data
-    const existing = shopTokens[shop];
-    existing.googleAnalyticsToken = {
-      accessToken: tokenData.access_token,
-      refreshToken: tokenData.refresh_token || null,
-      expiresAt: Date.now() + (tokenData.expires_in * 1000),
-    };
-    console.log("[google] saved GA token for", shop);
-
-    // Clean up session state
-    delete req.session.gaState;
-    delete req.session.gaShop;
-
-    // Redirect back to settings inside Shopify admin
-    const storeSlug = shop.replace(".myshopify.com", "");
-    const adminUrl = `https://admin.shopify.com/store/${storeSlug}/apps/${APP_HANDLE}`;
-    console.log("[google-callback] redirecting to:", adminUrl);
-    res.redirect(adminUrl);
+    res.json({
+      status: "ok",
+      propertyId: GA_PROPERTY_ID,
+      period: "last 30 days",
+      metrics: data,
+    });
   } catch (err) {
-    console.error("[google-callback] error:", err);
-    res.status(500).send("Google Analytics connection failed. Check server logs.");
+    console.error("[test-ga] error:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message,
+    });
   }
 });
 
@@ -613,7 +584,7 @@ function buildDashboardHtml(storeName, shop, products, orders) {
 function buildSettingsHtml(shop, tokenData) {
   const shopParam = encodeURIComponent(shop);
   const metaConnected = !!tokenData.metaAdsToken;
-  const gaConnected = !!tokenData.googleAnalyticsToken;
+  const gaConfigured = !!(GA_PROPERTY_ID && GA_SERVICE_ACCOUNT_EMAIL && GA_PRIVATE_KEY);
 
   return `
     <!DOCTYPE html>
@@ -702,9 +673,9 @@ function buildSettingsHtml(shop, tokenData) {
                 <div class="source-desc">Traffic, sessions, and user behavior</div>
               </div>
             </div>
-            ${gaConnected
-              ? '<span class="status-connected">&#10003; Connected</span>'
-              : `<a class="btn-connect" href="/connect/google-analytics?shop=${shopParam}">Connect</a>`
+            ${gaConfigured
+              ? `<span class="status-connected">&#10003; Connected (${escapeHtml(GA_PROPERTY_ID)})</span>`
+              : '<span style="color:#6b7177;font-size:13px">Not configured &mdash; add GA_PROPERTY_ID to env</span>'
             }
           </div>
 
