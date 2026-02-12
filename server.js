@@ -12,8 +12,7 @@ const SCOPES = "read_products,read_orders";
 const HOST = process.env.HOST; // e.g. https://your-app.up.railway.app
 const APP_HANDLE = process.env.APP_HANDLE || "mr-bean";
 const GA_PROPERTY_ID = process.env.GA_PROPERTY_ID;
-const GA_SERVICE_ACCOUNT_EMAIL = process.env.GA_SERVICE_ACCOUNT_EMAIL;
-const GA_PRIVATE_KEY = process.env.GA_PRIVATE_KEY?.replace(/\\n/g, "\n");
+const GA_SERVICE_ACCOUNT_JSON = process.env.GA_SERVICE_ACCOUNT_JSON;
 
 if (!SHOPIFY_API_KEY || !SHOPIFY_API_SECRET) {
   console.error("Missing SHOPIFY_API_KEY or SHOPIFY_API_SECRET env vars");
@@ -139,17 +138,25 @@ async function shopifyFetch(shop, accessToken, endpoint) {
 }
 
 async function fetchGoogleAnalyticsData() {
-  if (!GA_PROPERTY_ID || !GA_SERVICE_ACCOUNT_EMAIL || !GA_PRIVATE_KEY) {
-    console.log("[ga] missing config — GA_PROPERTY_ID, GA_SERVICE_ACCOUNT_EMAIL, or GA_PRIVATE_KEY");
+  if (!GA_PROPERTY_ID || !GA_SERVICE_ACCOUNT_JSON) {
+    console.log("[ga] missing config — GA_PROPERTY_ID or GA_SERVICE_ACCOUNT_JSON");
     return null;
   }
 
   const { google } = require("googleapis");
 
+  let serviceAccount;
+  try {
+    serviceAccount = JSON.parse(GA_SERVICE_ACCOUNT_JSON);
+  } catch (err) {
+    console.error("[ga] failed to parse GA_SERVICE_ACCOUNT_JSON:", err.message);
+    return null;
+  }
+
   const auth = new google.auth.JWT(
-    GA_SERVICE_ACCOUNT_EMAIL,
+    serviceAccount.client_email,
     null,
-    GA_PRIVATE_KEY,
+    serviceAccount.private_key,
     ["https://www.googleapis.com/auth/analytics.readonly"]
   );
 
@@ -442,7 +449,7 @@ app.get("/test-ga", async (_req, res) => {
     const data = await fetchGoogleAnalyticsData();
     if (!data) {
       return res.status(500).send(
-        "Google Analytics not configured. Set GA_PROPERTY_ID, GA_SERVICE_ACCOUNT_EMAIL, and GA_PRIVATE_KEY in .env"
+        "Google Analytics not configured. Set GA_PROPERTY_ID and GA_SERVICE_ACCOUNT_JSON in .env"
       );
     }
     res.json({
@@ -584,7 +591,7 @@ function buildDashboardHtml(storeName, shop, products, orders) {
 function buildSettingsHtml(shop, tokenData) {
   const shopParam = encodeURIComponent(shop);
   const metaConnected = !!tokenData.metaAdsToken;
-  const gaConfigured = !!(GA_PROPERTY_ID && GA_SERVICE_ACCOUNT_EMAIL && GA_PRIVATE_KEY);
+  const gaConfigured = !!(GA_PROPERTY_ID && GA_SERVICE_ACCOUNT_JSON);
 
   return `
     <!DOCTYPE html>
