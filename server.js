@@ -307,7 +307,7 @@ async function fetchMetaAdsData() {
   return result;
 }
 
-async function generateTileInsights(shopifyStats, gaData, metaAdsData) {
+async function generateTileInsights(shopifyStats, gaData, metaAdsData, topProducts) {
   if (!ANTHROPIC_API_KEY) {
     console.log("[insights] ANTHROPIC_API_KEY not set");
     return null;
@@ -348,34 +348,55 @@ async function generateTileInsights(shopifyStats, gaData, metaAdsData) {
     dataContext += `Meta Ads: Not connected\n`;
   }
 
+  // Add top products context
+  if (topProducts) {
+    if (topProducts.byRevenue.length > 0) {
+      dataContext += `\nTop products by revenue:\n`;
+      topProducts.byRevenue.forEach((p, i) => {
+        dataContext += `${i + 1}. ${p.title} \u2014 \u00a3${p.revenue.toFixed(2)} (${p.units} units)\n`;
+      });
+    }
+    if (topProducts.byUnits.length > 0) {
+      dataContext += `\nTop products by units sold:\n`;
+      topProducts.byUnits.forEach((p, i) => {
+        dataContext += `${i + 1}. ${p.title} \u2014 ${p.units} units (\u00a3${p.revenue.toFixed(2)})\n`;
+      });
+    }
+  }
+
   const hasMetaAds = !!metaAdsData;
 
-  const prompt = `You're a sharp e-commerce advisor texting a store owner. Casual, direct, helpful.
+  const prompt = `You're a sharp e-commerce advisor. Concise, data-driven, actionable.
 
 ${dataContext}
-RULES:
+STRICT RULES:
 - Do NOT calculate conversion rate (orders \u00f7 sessions) \u2014 the data sources aren't linked
-- Use \u00a3 for currency. If revenue is estimated, note it with a ~ prefix
-- Use "you" and "your". Be specific, not generic. Every word should help make a decision
-- Use emoji naturally but don't overdo it
+- Use \u00a3 for currency. If revenue is estimated, note with ~ prefix
+- Use emoji STRATEGICALLY only: \ud83d\udcc8\ud83d\udcc9 trends, \ud83d\udcb0 money, \u26a0\ufe0f problems, \u2705 wins, \ud83c\udfaf actions
+- No filler words. Every sentence must be actionable or data-driven
+- NEVER just celebrate wins. Every positive MUST include "but here's how to go further"
+- Format positives as: [Current state] \u2192 [Action] = [Expected result]
+- Use SPECIFIC product names from the data. Never say "your products" \u2014 name them
 ${hasMetaAds ? "- ROAS = Revenue from ads \u00f7 Ad spend. Use this to assess ad efficiency\n" : ""}
 Respond with EXACTLY these ${hasMetaAds ? "5" : "4"} sections using ### headers:
 
 ### HEALTH CHECK
-Status emoji (use exactly one: \ud83d\udfe2 healthy, \ud83d\udfe1 needs attention, or \ud83d\udd34 critical) then a one-line verdict.
-Then on new lines show 3 key metrics with context: Revenue, Orders, AOV. Format each as "Label: \u00a3X,XXX" with a brief note. 50 words max total.
+Start with EXACTLY one status emoji: \ud83d\udfe2 (healthy), \ud83d\udfe1 (needs attention), or \ud83d\udd34 (critical).
+One-line verdict. Then 3 key metrics on new lines: Revenue, Orders, AOV \u2014 each with brief context.
+Every metric must include an improvement action. 40 words max total.
 
 ### BIGGEST ISSUE
-What's costing the most money right now? State the specific problem, the \u00a3 impact, and what to fix. Be blunt. 40 words max.
+The #1 thing costing money right now. Name the specific problem, the \u00a3 impact, and one fix. Be blunt. 30 words max.
 
 ### QUICK WIN
-One specific action for THIS WEEK. What to do, where to do it, and the expected impact. 30 words max.
+One specific action for THIS WEEK. Name the product/page/campaign. What to do and expected \u00a3 impact. 30 words max.
 
 ### OPPORTUNITY
-One growth pattern you spot in the data. Specific recommendation with realistic \u00a3 potential over 30 days. 40 words max.${hasMetaAds ? `
+One growth pattern from the data. Name specific products. Recommendation with realistic \u00a3 potential over 30 days. 30 words max.${hasMetaAds ? `
 
 ### AD PERFORMANCE
-Based on Meta Ads data, what's working and what's not? State the ROAS, whether it's good/bad, and one specific optimization to improve it. 40 words max.` : ""}`;
+Start with EXACTLY one status emoji: \ud83d\udfe2 (ROAS >2.5), \ud83d\udfe1 (ROAS 1.5-2.5), or \ud83d\udd34 (ROAS <1.5).
+ROAS value, verdict, and one specific optimization. Name what to change. 30 words max.` : ""}`;
 
   console.log("[insights] sending tile prompt to Claude...");
 
@@ -403,7 +424,23 @@ Based on Meta Ads data, what's working and what's not? State the ROAS, whether i
     else if (firstLine.includes("AD") && firstLine.includes("PERF")) tiles.adPerformance = body;
   }
 
-  console.log("[insights] parsed tiles:", Object.keys(tiles).map(k => `${k}: ${tiles[k].length} chars`));
+  // Determine health check severity from emoji
+  let healthSeverity = "healthy";
+  if (tiles.healthCheck.includes("\ud83d\udfe1")) healthSeverity = "warning";
+  else if (tiles.healthCheck.includes("\ud83d\udd34")) healthSeverity = "critical";
+
+  // Determine ad performance severity from ROAS
+  let adSeverity = "healthy";
+  if (metaAdsData && metaAdsData.spend > 0) {
+    const roas = metaAdsData.revenue / metaAdsData.spend;
+    if (roas < 1.5) adSeverity = "critical";
+    else if (roas <= 2.5) adSeverity = "warning";
+  }
+
+  tiles.healthSeverity = healthSeverity;
+  tiles.adSeverity = adSeverity;
+
+  console.log("[insights] parsed tiles:", Object.keys(tiles).map(k => `${k}: ${typeof tiles[k] === "string" ? tiles[k].length + " chars" : tiles[k]}`));
   return tiles;
 }
 
@@ -667,6 +704,23 @@ app.get("/dashboard", async (req, res) => {
 
           const shopifyStats = { orderCount, revenue, avgOrderValue, sampleSize, revenueIsEstimated };
 
+          // Extract top products from sample orders
+          const productMap = {};
+          for (const order of sampleOrders) {
+            for (const item of (order.line_items || [])) {
+              const key = item.title || "Unknown";
+              if (!productMap[key]) productMap[key] = { title: key, revenue: 0, units: 0 };
+              productMap[key].revenue += parseFloat(item.price || 0) * (item.quantity || 1);
+              productMap[key].units += item.quantity || 1;
+            }
+          }
+          const allProducts = Object.values(productMap);
+          const topProducts = {
+            byRevenue: [...allProducts].sort((a, b) => b.revenue - a.revenue).slice(0, 3),
+            byUnits: [...allProducts].sort((a, b) => b.units - a.units).slice(0, 3),
+          };
+          console.log("[dashboard] top products by revenue:", topProducts.byRevenue.map(p => p.title));
+
           let gaData = null;
           try {
             gaData = await fetchGoogleAnalyticsData();
@@ -681,7 +735,7 @@ app.get("/dashboard", async (req, res) => {
             console.log("[dashboard] Meta Ads fetch failed (continuing without):", metaErr.message);
           }
 
-          const tiles = await generateTileInsights(shopifyStats, gaData, metaAdsData);
+          const tiles = await generateTileInsights(shopifyStats, gaData, metaAdsData, topProducts);
 
           insightsData = { tiles, shopifyStats, gaData, metaAdsData };
           setCachedInsights(shop, insightsData);
@@ -761,6 +815,22 @@ app.get("/insights", async (req, res) => {
     const shopifyStats = { orderCount, revenue, avgOrderValue, sampleSize, revenueIsEstimated };
     console.log("[insights] shopify stats:", shopifyStats);
 
+    // Extract top products from sample orders
+    const productMap = {};
+    for (const order of sampleOrders) {
+      for (const item of (order.line_items || [])) {
+        const key = item.title || "Unknown";
+        if (!productMap[key]) productMap[key] = { title: key, revenue: 0, units: 0 };
+        productMap[key].revenue += parseFloat(item.price || 0) * (item.quantity || 1);
+        productMap[key].units += item.quantity || 1;
+      }
+    }
+    const allProducts = Object.values(productMap);
+    const topProducts = {
+      byRevenue: [...allProducts].sort((a, b) => b.revenue - a.revenue).slice(0, 3),
+      byUnits: [...allProducts].sort((a, b) => b.units - a.units).slice(0, 3),
+    };
+
     // Fetch GA data (may be null if not configured)
     let gaData = null;
     try {
@@ -778,7 +848,7 @@ app.get("/insights", async (req, res) => {
     }
 
     // Generate tile insights with Claude
-    const tiles = await generateTileInsights(shopifyStats, gaData, metaAdsData);
+    const tiles = await generateTileInsights(shopifyStats, gaData, metaAdsData, topProducts);
 
     res.json({
       shopifyStats,
@@ -828,7 +898,7 @@ app.get("/settings", (req, res) => {
     return res.redirect("/install");
   }
 
-  res.send(buildSettingsHtml(shop, tokenData));
+  res.send(buildSettingsHtml(shop));
 });
 
 // Health check for Railway
@@ -854,7 +924,10 @@ function buildDashboardHtml(storeName, shop, insightsData) {
   const dateTo = now.toLocaleDateString("en-GB", { month: "short", day: "numeric", year: "numeric" });
   const dateRange = `${dateFrom} - ${dateTo}`;
 
-  // Data freshness bar
+  const forceRefresh = false; // will be checked from query param in route
+  const justRefreshed = insightsData && insightsData.generatedAt && (Date.now() - insightsData.generatedAt < 5000);
+
+  // Data freshness cards
   let freshnessHtml = "";
   if (insightsData) {
     const stats = insightsData.shopifyStats;
@@ -865,32 +938,63 @@ function buildDashboardHtml(storeName, shop, insightsData) {
     const isToday = updatedAt.toDateString() === now.toDateString();
     const updatedLabel = isToday ? `Today at ${timeStr}` : updatedAt.toLocaleDateString("en-GB", { month: "short", day: "numeric" }) + ` at ${timeStr}`;
 
-    let metaFreshnessHtml;
-    if (meta) {
-      metaFreshnessHtml = `<span class="freshness-item connected-source">Meta Ads: \u00a3${meta.spend.toFixed(0)} spend, ${meta.clicks.toLocaleString()} clicks (${dateRange})</span>`;
-    } else {
-      metaFreshnessHtml = `<span class="freshness-item disconnected-source">Meta Ads: Not connected</span>`;
-    }
+    const metaRoas = meta && meta.spend > 0 ? (meta.revenue / meta.spend).toFixed(2) : null;
 
     freshnessHtml = `
-      <div class="freshness">
-        <div class="freshness-sources">
-          <span class="freshness-item connected-source">Shopify: ${stats.orderCount.toLocaleString()} orders (${dateRange})</span>
-          ${ga
-            ? `<span class="freshness-item connected-source">Google Analytics: ${ga.sessions.toLocaleString()} sessions (${dateRange})</span>`
-            : `<span class="freshness-item disconnected-source">Google Analytics: Not connected</span>`
-          }
-          ${metaFreshnessHtml}
+      ${justRefreshed ? '<div class="refresh-flash">\u2705 Insights refreshed</div>' : ""}
+      <div class="freshness-cards">
+        <div class="freshness-card">
+          <div class="freshness-card-icon">\ud83d\uded2</div>
+          <div class="freshness-card-body">
+            <div class="freshness-card-title">Shopify</div>
+            <div class="freshness-card-metric">${stats.orderCount.toLocaleString()} orders</div>
+            <div class="freshness-card-sub">${dateRange}</div>
+          </div>
         </div>
-        <div class="freshness-meta">
-          Last updated: ${escapeHtml(updatedLabel)} &middot; <a href="/dashboard?shop=${shopParam}&refresh=1" class="refresh-link">Refresh</a>
+        <div class="freshness-card${ga ? "" : " freshness-card-off"}">
+          <div class="freshness-card-icon">\ud83d\udcca</div>
+          <div class="freshness-card-body">
+            <div class="freshness-card-title">Analytics</div>
+            ${ga
+              ? `<div class="freshness-card-metric">${ga.sessions.toLocaleString()} sessions</div>
+                 <div class="freshness-card-sub">${(ga.bounceRate * 100).toFixed(1)}% bounce</div>`
+              : `<div class="freshness-card-metric dim">Not connected</div>`
+            }
+          </div>
         </div>
+        <div class="freshness-card${meta ? "" : " freshness-card-off"}">
+          <div class="freshness-card-icon">\ud83d\udcf1</div>
+          <div class="freshness-card-body">
+            <div class="freshness-card-title">Meta Ads</div>
+            ${meta
+              ? `<div class="freshness-card-metric">\u00a3${meta.spend.toFixed(0)} spend</div>
+                 <div class="freshness-card-sub">${metaRoas}x ROAS</div>`
+              : `<div class="freshness-card-metric dim">Not connected</div>`
+            }
+          </div>
+        </div>
+      </div>
+      <div class="freshness-footer">
+        Last updated: ${escapeHtml(updatedLabel)} &middot; <a href="/dashboard?shop=${shopParam}&refresh=1" class="refresh-link">\u2728 Refresh</a>
       </div>`;
   }
 
-  // Get tiles
+  // Get tiles and determine dynamic classes
   const tiles = insightsData?.tiles;
   const hasTiles = tiles && (tiles.healthCheck || tiles.biggestIssue || tiles.quickWin || tiles.opportunity || tiles.adPerformance);
+
+  // Dynamic tile class based on severity
+  const healthClass = tiles ? ({
+    healthy: "tile-healthy",
+    warning: "tile-warning",
+    critical: "tile-critical",
+  }[tiles.healthSeverity] || "tile-healthy") : "tile-healthy";
+
+  const adClass = tiles ? ({
+    healthy: "tile-healthy",
+    warning: "tile-warning",
+    critical: "tile-critical",
+  }[tiles.adSeverity] || "tile-healthy") : "tile-healthy";
 
   return `
     <!DOCTYPE html>
@@ -920,13 +1024,21 @@ function buildDashboardHtml(storeName, shop, insightsData) {
         .connected-bar strong { font-weight: 600; }
         .container { max-width: 960px; margin: 24px auto; padding: 0 24px; }
 
-        /* Freshness bar */
-        .freshness { background: #fff; border-radius: 12px; padding: 16px 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-        .freshness-sources { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
-        .freshness-item { font-size: 12px; padding: 4px 10px; border-radius: 6px; font-weight: 500; }
-        .connected-source { background: #dcfce7; color: #166534; }
-        .disconnected-source { background: #f3f4f6; color: #6b7280; }
-        .freshness-meta { font-size: 12px; color: #6b7280; }
+        /* Refresh flash */
+        .refresh-flash { background: #dcfce7; color: #166534; padding: 12px 20px; border-radius: 10px; font-size: 14px; font-weight: 500; margin-bottom: 12px; text-align: center; animation: fadeOut 3s ease-in-out forwards; }
+        @keyframes fadeOut { 0%, 70% { opacity: 1; } 100% { opacity: 0; } }
+
+        /* Freshness cards */
+        .freshness-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 8px; }
+        .freshness-card { background: #fff; border-radius: 12px; padding: 16px; display: flex; gap: 12px; align-items: center; box-shadow: 0 1px 3px rgba(0,0,0,0.06); border: 1px solid #e5e7eb; }
+        .freshness-card-off { opacity: 0.5; }
+        .freshness-card-icon { font-size: 24px; }
+        .freshness-card-body { flex: 1; }
+        .freshness-card-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; margin-bottom: 2px; }
+        .freshness-card-metric { font-size: 16px; font-weight: 700; color: #1a1a1a; }
+        .freshness-card-metric.dim { font-weight: 400; color: #9ca3af; font-size: 13px; }
+        .freshness-card-sub { font-size: 12px; color: #6b7280; margin-top: 1px; }
+        .freshness-footer { font-size: 12px; color: #6b7280; text-align: center; padding: 8px 0 4px; margin-bottom: 16px; }
         .refresh-link { color: #008060; text-decoration: none; font-weight: 500; }
         .refresh-link:hover { text-decoration: underline; }
 
@@ -938,17 +1050,17 @@ function buildDashboardHtml(storeName, shop, insightsData) {
         .tile-body { font-size: 15px; line-height: 1.7; color: #374151; }
         .tile-body strong { color: #1a1a1a; font-weight: 600; }
 
-        /* Tile colors */
-        .tile-health { background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%); border: 1px solid #bbf7d0; }
-        .tile-health .tile-label { color: #166534; }
-        .tile-issue { background: linear-gradient(135deg, #fef2f2 0%, #fff1f2 100%); border: 1px solid #fecaca; }
-        .tile-issue .tile-label { color: #991b1b; }
-        .tile-win { background: linear-gradient(135deg, #eff6ff 0%, #f0f9ff 100%); border: 1px solid #bfdbfe; }
-        .tile-win .tile-label { color: #1e40af; }
-        .tile-opp { background: linear-gradient(135deg, #fefce8 0%, #fef9c3 100%); border: 1px solid #fde68a; }
-        .tile-opp .tile-label { color: #92400e; }
-        .tile-ads { background: linear-gradient(135deg, #ede9fe 0%, #f5f3ff 100%); border: 1px solid #c4b5fd; }
-        .tile-ads .tile-label { color: #5b21b6; }
+        /* Dynamic tile colors */
+        .tile-healthy { background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%); border: 1px solid #bbf7d0; }
+        .tile-healthy .tile-label { color: #166534; }
+        .tile-warning { background: linear-gradient(135deg, #fefce8 0%, #fef9c3 100%); border: 1px solid #fde68a; }
+        .tile-warning .tile-label { color: #92400e; }
+        .tile-critical { background: linear-gradient(135deg, #fef2f2 0%, #fff1f2 100%); border: 1px solid #fecaca; }
+        .tile-critical .tile-label { color: #991b1b; }
+        .tile-action { background: linear-gradient(135deg, #eff6ff 0%, #f0f9ff 100%); border: 1px solid #bfdbfe; }
+        .tile-action .tile-label { color: #1e40af; }
+        .tile-opportunity { background: linear-gradient(135deg, #fefce8 0%, #fef9c3 100%); border: 1px solid #fde68a; }
+        .tile-opportunity .tile-label { color: #92400e; }
 
         /* Error state */
         .insights-error { background: #fff; border-radius: 14px; padding: 40px; text-align: center; color: #6b7280; font-size: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
@@ -962,6 +1074,7 @@ function buildDashboardHtml(storeName, shop, insightsData) {
         @media (max-width: 640px) {
           .tile-grid { grid-template-columns: 1fr; }
           .tile.full { grid-column: 1; }
+          .freshness-cards { grid-template-columns: 1fr; }
         }
       </style>
     </head>
@@ -971,7 +1084,6 @@ function buildDashboardHtml(storeName, shop, insightsData) {
         <nav>
           <a href="/dashboard?shop=${shopParam}" class="active">Dashboard</a>
           <a href="/settings?shop=${shopParam}">Settings</a>
-          <a href="/disconnect?shop=${shopParam}">Disconnect</a>
         </nav>
       </div>
       <div class="connected-bar">Connected to: <strong>${escapeHtml(storeName)}</strong> (${escapeHtml(shop)})</div>
@@ -991,28 +1103,28 @@ function buildDashboardHtml(storeName, shop, insightsData) {
         ` : `
         <div class="tile-grid">
 
-          <div class="tile tile-health full">
+          <div class="tile ${healthClass} full">
             <div class="tile-label">\ud83c\udfe5 Health Check</div>
             <div class="tile-body">${formatTileHtml(tiles.healthCheck)}</div>
           </div>
 
-          <div class="tile tile-issue">
+          <div class="tile tile-critical">
             <div class="tile-label">\ud83d\udea8 Biggest Issue</div>
             <div class="tile-body">${formatTileHtml(tiles.biggestIssue)}</div>
           </div>
 
-          <div class="tile tile-win">
+          <div class="tile tile-action">
             <div class="tile-label">\u26a1 Quick Win</div>
             <div class="tile-body">${formatTileHtml(tiles.quickWin)}</div>
           </div>
 
-          <div class="tile tile-opp full">
+          <div class="tile tile-opportunity full">
             <div class="tile-label">\ud83c\udf1f Opportunity</div>
             <div class="tile-body">${formatTileHtml(tiles.opportunity)}</div>
           </div>
 
           ${tiles.adPerformance ? `
-          <div class="tile tile-ads full">
+          <div class="tile ${adClass} full">
             <div class="tile-label">\ud83d\udcb0 Ad Performance</div>
             <div class="tile-body">${formatTileHtml(tiles.adPerformance)}</div>
           </div>
@@ -1027,10 +1139,15 @@ function buildDashboardHtml(storeName, shop, insightsData) {
   `;
 }
 
-function buildSettingsHtml(shop, tokenData) {
+function buildSettingsHtml(shop) {
   const shopParam = encodeURIComponent(shop);
   const metaConfigured = !!(META_SYSTEM_USER_TOKEN && META_AD_ACCOUNT_ID);
   const gaConfigured = !!(GA_PROPERTY_ID && GA_SERVICE_ACCOUNT_JSON);
+  const claudeConfigured = !!ANTHROPIC_API_KEY;
+
+  const accountIdDisplay = META_AD_ACCOUNT_ID
+    ? (META_AD_ACCOUNT_ID.length > 10 ? META_AD_ACCOUNT_ID.substring(0, 10) + "\u2026" : META_AD_ACCOUNT_ID)
+    : "";
 
   return `
     <!DOCTYPE html>
@@ -1038,7 +1155,7 @@ function buildSettingsHtml(shop, tokenData) {
     <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Settings — Data Sources</title>
+      <title>Settings \u2014 Data Sources</title>
       <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
       <script>
         shopify.config = {
@@ -1056,21 +1173,23 @@ function buildSettingsHtml(shop, tokenData) {
         .topbar a { color: #b5b5b5; text-decoration: none; font-size: 14px; }
         .topbar a:hover { color: #fff; }
         .topbar a.active { color: #fff; }
-        .container { max-width: 960px; margin: 32px auto; padding: 0 24px; }
-        .section { background: #fff; border-radius: 12px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-        .section h2 { font-size: 16px; margin-bottom: 16px; color: #333; }
-        .source-row { display: flex; align-items: center; justify-content: space-between; padding: 16px 0; border-bottom: 1px solid #f1f1f1; }
-        .source-row:last-child { border-bottom: none; }
-        .source-info { display: flex; align-items: center; gap: 12px; }
-        .source-icon { width: 40px; height: 40px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 18px; }
-        .source-icon.shopify { background: #96bf48; color: #fff; }
-        .source-icon.meta { background: #1877f2; color: #fff; }
-        .source-icon.ga { background: #e37400; color: #fff; }
-        .source-name { font-size: 15px; font-weight: 500; }
-        .source-desc { font-size: 13px; color: #6b7177; margin-top: 2px; }
-        .status-connected { color: #008060; font-size: 14px; font-weight: 500; }
-        .btn-connect { display: inline-block; padding: 8px 20px; background: #008060; color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; text-decoration: none; }
-        .btn-connect:hover { background: #006e52; }
+        .container { max-width: 720px; margin: 32px auto; padding: 0 24px; }
+        .settings-title { font-size: 20px; font-weight: 600; margin-bottom: 20px; color: #1a1a1a; }
+        .source-card { background: #fff; border-radius: 14px; padding: 20px 24px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); border: 1px solid #e5e7eb; display: flex; align-items: center; gap: 16px; }
+        .source-card.connected { border-left: 4px solid #10b981; }
+        .source-card.disconnected { border-left: 4px solid #d1d5db; opacity: 0.7; }
+        .source-card-icon { font-size: 28px; width: 48px; height: 48px; border-radius: 12px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+        .icon-shopify { background: #96bf48; color: #fff; font-size: 20px; font-weight: 700; }
+        .icon-ga { background: #e37400; color: #fff; font-size: 20px; font-weight: 700; }
+        .icon-meta { background: #1877f2; color: #fff; font-size: 20px; font-weight: 700; }
+        .icon-claude { background: #d97706; color: #fff; font-size: 20px; font-weight: 700; }
+        .source-card-body { flex: 1; }
+        .source-card-header { display: flex; align-items: center; gap: 8px; margin-bottom: 2px; }
+        .source-card-name { font-size: 16px; font-weight: 600; }
+        .source-card-badge { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px; }
+        .badge-connected { background: #dcfce7; color: #166534; }
+        .badge-off { background: #f3f4f6; color: #6b7280; }
+        .source-card-detail { font-size: 13px; color: #6b7280; line-height: 1.4; }
       </style>
     </head>
     <body>
@@ -1079,53 +1198,73 @@ function buildSettingsHtml(shop, tokenData) {
         <nav>
           <a href="/dashboard?shop=${shopParam}">Dashboard</a>
           <a href="/settings?shop=${shopParam}" class="active">Settings</a>
-          <a href="/disconnect?shop=${shopParam}">Disconnect</a>
         </nav>
       </div>
       <div class="container">
-        <div class="section">
-          <h2>Data Sources</h2>
+        <div class="settings-title">Data Sources</div>
 
-          <div class="source-row">
-            <div class="source-info">
-              <div class="source-icon shopify">S</div>
-              <div>
-                <div class="source-name">Shopify</div>
-                <div class="source-desc">Orders, products, and store data</div>
-              </div>
+        <div class="source-card connected">
+          <div class="source-card-icon icon-shopify">S</div>
+          <div class="source-card-body">
+            <div class="source-card-header">
+              <span class="source-card-name">Shopify</span>
+              <span class="source-card-badge badge-connected">\u2705 Connected</span>
             </div>
-            <span class="status-connected">&#10003; Connected</span>
+            <div class="source-card-detail">${escapeHtml(shop)}</div>
           </div>
-
-          <div class="source-row">
-            <div class="source-info">
-              <div class="source-icon meta">f</div>
-              <div>
-                <div class="source-name">Meta Ads</div>
-                <div class="source-desc">Ad spend, impressions, and conversions</div>
-              </div>
-            </div>
-            ${metaConfigured
-              ? '<span class="status-connected">&#10003; Connected (System User)</span>'
-              : '<span style="color:#6b7177;font-size:13px">Not configured &mdash; add META_SYSTEM_USER_TOKEN to env</span>'
-            }
-          </div>
-
-          <div class="source-row">
-            <div class="source-info">
-              <div class="source-icon ga">G</div>
-              <div>
-                <div class="source-name">Google Analytics</div>
-                <div class="source-desc">Traffic, sessions, and user behavior</div>
-              </div>
-            </div>
-            ${gaConfigured
-              ? `<span class="status-connected">&#10003; Connected (${escapeHtml(GA_PROPERTY_ID)})</span>`
-              : '<span style="color:#6b7177;font-size:13px">Not configured &mdash; add GA_PROPERTY_ID to env</span>'
-            }
-          </div>
-
         </div>
+
+        <div class="source-card ${gaConfigured ? "connected" : "disconnected"}">
+          <div class="source-card-icon icon-ga">G</div>
+          <div class="source-card-body">
+            <div class="source-card-header">
+              <span class="source-card-name">Google Analytics</span>
+              ${gaConfigured
+                ? '<span class="source-card-badge badge-connected">\u2705 Connected</span>'
+                : '<span class="source-card-badge badge-off">Not configured</span>'
+              }
+            </div>
+            <div class="source-card-detail">${gaConfigured
+              ? `Property ID: ${escapeHtml(GA_PROPERTY_ID)}<br>Service account active`
+              : "Add GA_PROPERTY_ID and GA_SERVICE_ACCOUNT_JSON to env"
+            }</div>
+          </div>
+        </div>
+
+        <div class="source-card ${metaConfigured ? "connected" : "disconnected"}">
+          <div class="source-card-icon icon-meta">f</div>
+          <div class="source-card-body">
+            <div class="source-card-header">
+              <span class="source-card-name">Meta Ads</span>
+              ${metaConfigured
+                ? '<span class="source-card-badge badge-connected">\u2705 Connected</span>'
+                : '<span class="source-card-badge badge-off">Not configured</span>'
+              }
+            </div>
+            <div class="source-card-detail">${metaConfigured
+              ? `System User connected<br>Account: ${escapeHtml(accountIdDisplay)}`
+              : "Add META_SYSTEM_USER_TOKEN and META_AD_ACCOUNT_ID to env"
+            }</div>
+          </div>
+        </div>
+
+        <div class="source-card ${claudeConfigured ? "connected" : "disconnected"}">
+          <div class="source-card-icon icon-claude">AI</div>
+          <div class="source-card-body">
+            <div class="source-card-header">
+              <span class="source-card-name">Claude AI</span>
+              ${claudeConfigured
+                ? '<span class="source-card-badge badge-connected">\u2705 Connected</span>'
+                : '<span class="source-card-badge badge-off">Not configured</span>'
+              }
+            </div>
+            <div class="source-card-detail">${claudeConfigured
+              ? "Generating business insights"
+              : "Add ANTHROPIC_API_KEY to env"
+            }</div>
+          </div>
+        </div>
+
       </div>
     </body>
     </html>
