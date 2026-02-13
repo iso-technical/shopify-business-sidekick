@@ -254,10 +254,13 @@ async function fetchMetaAdsData() {
   const since = thirtyDaysAgo.toISOString().split("T")[0];
   const until = today.toISOString().split("T")[0];
 
+  const accountId = META_AD_ACCOUNT_ID.startsWith("act_")
+    ? META_AD_ACCOUNT_ID
+    : `act_${META_AD_ACCOUNT_ID}`;
   const timeRange = JSON.stringify({ since, until });
   const fields = "spend,impressions,clicks,actions,action_values";
   const url =
-    `https://graph.facebook.com/v18.0/${META_AD_ACCOUNT_ID}/insights` +
+    `https://graph.facebook.com/v18.0/${accountId}/insights` +
     `?access_token=${encodeURIComponent(META_SYSTEM_USER_TOKEN)}` +
     `&time_range=${encodeURIComponent(timeRange)}` +
     `&fields=${fields}` +
