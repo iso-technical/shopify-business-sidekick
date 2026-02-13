@@ -14,8 +14,8 @@ const APP_HANDLE = process.env.APP_HANDLE || "mr-bean";
 const GA_PROPERTY_ID = process.env.GA_PROPERTY_ID;
 const GA_SERVICE_ACCOUNT_JSON = process.env.GA_SERVICE_ACCOUNT_JSON;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const META_APP_ID = process.env.META_APP_ID;
-const META_APP_SECRET = process.env.META_APP_SECRET;
+const META_SYSTEM_USER_TOKEN = process.env.META_SYSTEM_USER_TOKEN;
+const META_AD_ACCOUNT_ID = process.env.META_AD_ACCOUNT_ID;
 
 if (!SHOPIFY_API_KEY || !SHOPIFY_API_SECRET) {
   console.error("Missing SHOPIFY_API_KEY or SHOPIFY_API_SECRET env vars");
@@ -32,14 +32,9 @@ function getShopToken(shop) {
 }
 
 function setShopToken(shop, accessToken) {
-  const existing = shopTokens[shop];
   shopTokens[shop] = {
     accessToken,
     installedAt: Date.now(),
-    metaAdsToken: existing?.metaAdsToken || null,
-    metaAdsUserId: existing?.metaAdsUserId || null,
-    metaAdAccountId: existing?.metaAdAccountId || null,
-    metaAdAccountName: existing?.metaAdAccountName || null,
   };
   console.log("[store] saved token for", shop);
 }
@@ -247,9 +242,9 @@ async function fetchGoogleAnalyticsData() {
   return metrics;
 }
 
-async function fetchMetaAdsData(metaAdsToken, metaAdAccountId) {
-  if (!metaAdsToken || !metaAdAccountId) {
-    console.log("[meta-api] skipping — no token or ad account ID");
+async function fetchMetaAdsData() {
+  if (!META_SYSTEM_USER_TOKEN || !META_AD_ACCOUNT_ID) {
+    console.log("[meta-api] skipping — META_SYSTEM_USER_TOKEN or META_AD_ACCOUNT_ID not set");
     return null;
   }
 
@@ -262,13 +257,13 @@ async function fetchMetaAdsData(metaAdsToken, metaAdAccountId) {
   const timeRange = JSON.stringify({ since, until });
   const fields = "spend,impressions,clicks,actions,action_values";
   const url =
-    `https://graph.facebook.com/v18.0/${metaAdAccountId}/insights` +
-    `?access_token=${encodeURIComponent(metaAdsToken)}` +
+    `https://graph.facebook.com/v18.0/${META_AD_ACCOUNT_ID}/insights` +
+    `?access_token=${encodeURIComponent(META_SYSTEM_USER_TOKEN)}` +
     `&time_range=${encodeURIComponent(timeRange)}` +
     `&fields=${fields}` +
     `&level=account`;
 
-  console.log("[meta-api] fetching ad insights for account:", metaAdAccountId);
+  console.log("[meta-api] fetching ad insights for account:", META_AD_ACCOUNT_ID);
   console.log("[meta-api] date range:", since, "to", until);
 
   const res = await fetch(url);
@@ -677,12 +672,10 @@ app.get("/dashboard", async (req, res) => {
           }
 
           let metaAdsData = null;
-          if (tokenData.metaAdsToken && tokenData.metaAdAccountId) {
-            try {
-              metaAdsData = await fetchMetaAdsData(tokenData.metaAdsToken, tokenData.metaAdAccountId);
-            } catch (metaErr) {
-              console.log("[dashboard] Meta Ads fetch failed (continuing without):", metaErr.message);
-            }
+          try {
+            metaAdsData = await fetchMetaAdsData();
+          } catch (metaErr) {
+            console.log("[dashboard] Meta Ads fetch failed (continuing without):", metaErr.message);
           }
 
           const tiles = await generateTileInsights(shopifyStats, gaData, metaAdsData);
@@ -773,14 +766,12 @@ app.get("/insights", async (req, res) => {
       console.log("[insights] GA fetch failed (continuing without):", gaErr.message);
     }
 
-    // Fetch Meta Ads data (may be null if not connected)
+    // Fetch Meta Ads data (may be null if not configured)
     let metaAdsData = null;
-    if (tokenData.metaAdsToken && tokenData.metaAdAccountId) {
-      try {
-        metaAdsData = await fetchMetaAdsData(tokenData.metaAdsToken, tokenData.metaAdAccountId);
-      } catch (metaErr) {
-        console.log("[insights] Meta Ads fetch failed (continuing without):", metaErr.message);
-      }
+    try {
+      metaAdsData = await fetchMetaAdsData();
+    } catch (metaErr) {
+      console.log("[insights] Meta Ads fetch failed (continuing without):", metaErr.message);
     }
 
     // Generate tile insights with Claude
@@ -819,211 +810,6 @@ app.get("/test-ga", async (_req, res) => {
       status: "error",
       message: err.message,
     });
-  }
-});
-
-// Meta Ads — show authorization page (breaks out of iframe)
-app.get("/connect/meta", (req, res) => {
-  const shop = req.query.shop;
-  if (!shop || !getShopToken(shop)) {
-    return res.redirect("/install");
-  }
-
-  if (!META_APP_ID || !META_APP_SECRET) {
-    console.log("[meta] META_APP_ID or META_APP_SECRET not configured");
-    return res.status(500).send("Meta Ads integration not configured. Set META_APP_ID and META_APP_SECRET in .env");
-  }
-
-  // Encode shop + nonce in the state parameter (travels through Facebook OAuth)
-  // This avoids relying on session cookies which can be lost across domains/tabs
-  const nonce = generateNonce();
-  const statePayload = Buffer.from(JSON.stringify({ nonce, shop })).toString("base64");
-
-  const redirectUri = `${HOST}/connect/meta/callback`;
-  const authUrl =
-    `https://www.facebook.com/v18.0/dialog/oauth` +
-    `?client_id=${META_APP_ID}` +
-    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-    `&scope=ads_read` +
-    `&state=${encodeURIComponent(statePayload)}`;
-
-  console.log("[meta] showing authorize page for shop:", shop, "| nonce:", nonce);
-
-  res.setHeader("X-Frame-Options", "DENY");
-  res.send(`
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="utf-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Connect Meta Ads</title>
-      <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f6f6f7; }
-        .card { background: #fff; border-radius: 12px; padding: 48px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); text-align: center; max-width: 440px; }
-        h1 { margin: 0 0 8px; font-size: 22px; color: #1a1a1a; }
-        p { color: #6b7177; margin: 0 0 24px; font-size: 15px; line-height: 1.5; }
-        a.btn { display: inline-block; padding: 12px 28px; background: #1877f2; color: #fff; text-decoration: none; border-radius: 8px; font-size: 15px; font-weight: 500; }
-        a.btn:hover { background: #1565c0; }
-      </style>
-    </head>
-    <body>
-      <div class="card">
-        <h1>Connect Meta Ads</h1>
-        <p>Click below to connect your Meta Ads account. A new window will open to complete authorization.</p>
-        <a class="btn" href="${escapeHtml(authUrl)}" target="_blank">Authorize Meta Ads</a>
-      </div>
-    </body>
-    </html>
-  `);
-});
-
-// Meta Ads — handle Facebook OAuth callback
-app.get("/connect/meta/callback", async (req, res) => {
-  const { code, state, error, error_description } = req.query;
-
-  // Decode shop + nonce from state parameter (no session dependency)
-  let stateData = {};
-  try {
-    stateData = JSON.parse(Buffer.from(state || "", "base64").toString("utf8"));
-  } catch (e) {
-    console.error("[meta-callback] failed to decode state:", e.message);
-  }
-
-  const { nonce, shop } = stateData;
-
-  console.log("[meta-callback] --- DEBUG STATE ---");
-  console.log("[meta-callback] raw state:", state);
-  console.log("[meta-callback] decoded nonce:", nonce);
-  console.log("[meta-callback] decoded shop:", shop);
-  console.log("[meta-callback] error:", error || "(none)");
-
-  if (error) {
-    console.log("[meta-callback] OAuth error:", error, error_description);
-    return res.redirect(`/settings?shop=${encodeURIComponent(shop || "")}&error=meta_denied`);
-  }
-
-  // Verify we got valid state data
-  if (!nonce || !shop) {
-    console.log("[meta-callback] INVALID STATE — missing nonce or shop");
-    return res.status(403).send("Invalid state parameter.");
-  }
-
-  if (!getShopToken(shop)) {
-    return res.redirect("/install");
-  }
-
-  try {
-    const redirectUri = `${HOST}/connect/meta/callback`;
-
-    // Exchange code for short-lived token
-    console.log("[meta-callback] exchanging code for access token...");
-    const tokenUrl =
-      `https://graph.facebook.com/v18.0/oauth/access_token` +
-      `?client_id=${META_APP_ID}` +
-      `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-      `&client_secret=${META_APP_SECRET}` +
-      `&code=${encodeURIComponent(code)}`;
-
-    const tokenRes = await fetch(tokenUrl);
-    const tokenData = await tokenRes.json();
-
-    console.log("[meta-callback] token response status:", tokenRes.status);
-
-    if (tokenData.error) {
-      console.error("[meta-callback] token error:", tokenData.error);
-      return res.redirect(`/settings?shop=${encodeURIComponent(shop)}&error=meta_token_failed`);
-    }
-
-    const shortLivedToken = tokenData.access_token;
-
-    // Exchange for long-lived token (60 days)
-    console.log("[meta-callback] exchanging for long-lived token...");
-    const longLivedUrl =
-      `https://graph.facebook.com/v18.0/oauth/access_token` +
-      `?grant_type=fb_exchange_token` +
-      `&client_id=${META_APP_ID}` +
-      `&client_secret=${META_APP_SECRET}` +
-      `&fb_exchange_token=${encodeURIComponent(shortLivedToken)}`;
-
-    const longLivedRes = await fetch(longLivedUrl);
-    const longLivedData = await longLivedRes.json();
-
-    if (longLivedData.error) {
-      console.error("[meta-callback] long-lived token error:", longLivedData.error);
-      // Fall back to short-lived token
-      console.log("[meta-callback] falling back to short-lived token");
-    }
-
-    const accessToken = longLivedData.access_token || shortLivedToken;
-    console.log("[meta-callback] got access token, length:", accessToken.length);
-
-    // Get user ID
-    console.log("[meta-callback] fetching user ID...");
-    const meRes = await fetch(`https://graph.facebook.com/v18.0/me?access_token=${encodeURIComponent(accessToken)}`);
-    const meData = await meRes.json();
-    const userId = meData.id || null;
-    console.log("[meta-callback] user ID:", userId);
-
-    // Get ad accounts
-    console.log("[meta-callback] fetching ad accounts...");
-    const adAccountsRes = await fetch(
-      `https://graph.facebook.com/v18.0/me/adaccounts?fields=id,name&access_token=${encodeURIComponent(accessToken)}`
-    );
-    const adAccountsData = await adAccountsRes.json();
-    const adAccounts = adAccountsData.data || [];
-
-    console.log("[meta-callback] found", adAccounts.length, "ad accounts");
-    if (adAccounts.length > 0) {
-      console.log("[meta-callback] first account:", adAccounts[0].id, adAccounts[0].name);
-    }
-
-    // Store Meta tokens in shopTokens
-    const tokenEntry = getShopToken(shop);
-    tokenEntry.metaAdsToken = accessToken;
-    tokenEntry.metaAdsUserId = userId;
-    tokenEntry.metaAdAccountId = adAccounts[0]?.id || null;
-    tokenEntry.metaAdAccountName = adAccounts[0]?.name || null;
-
-    console.log("[meta-callback] saved Meta tokens for shop:", shop);
-
-    // Clear insights cache so next dashboard load picks up Meta data
-    delete insightsCache[shop];
-
-    // Show success page — this is in a popup/new tab
-    const accountName = adAccounts[0]?.name || "your account";
-    const storeSlug = shop.replace(".myshopify.com", "");
-    const adminUrl = `https://admin.shopify.com/store/${storeSlug}/apps/${APP_HANDLE}`;
-
-    res.send(`
-      <!DOCTYPE html>
-      <html lang="en">
-      <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Meta Ads Connected</title>
-        <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #f6f6f7; }
-          .card { background: #fff; border-radius: 12px; padding: 48px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); text-align: center; max-width: 440px; }
-          .check { font-size: 48px; margin-bottom: 16px; }
-          h1 { margin: 0 0 8px; font-size: 22px; color: #1a1a1a; }
-          p { color: #6b7177; margin: 0 0 24px; font-size: 15px; line-height: 1.5; }
-          a.btn { display: inline-block; padding: 12px 28px; background: #008060; color: #fff; text-decoration: none; border-radius: 8px; font-size: 15px; font-weight: 500; }
-          a.btn:hover { background: #006e52; }
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <div class="check">&#10003;</div>
-          <h1>Meta Ads Connected</h1>
-          <p>Successfully connected to ${escapeHtml(accountName)}. You can close this window and return to your dashboard.</p>
-          <a class="btn" href="${escapeHtml(adminUrl)}">Back to Dashboard</a>
-        </div>
-      </body>
-      </html>
-    `);
-  } catch (err) {
-    console.error("[meta-callback] error:", err);
-    res.redirect(`/settings?shop=${encodeURIComponent(shop)}&error=meta_failed`);
   }
 });
 
@@ -1240,7 +1026,7 @@ function buildDashboardHtml(storeName, shop, insightsData) {
 
 function buildSettingsHtml(shop, tokenData) {
   const shopParam = encodeURIComponent(shop);
-  const metaConnected = !!tokenData.metaAdsToken;
+  const metaConfigured = !!(META_SYSTEM_USER_TOKEN && META_AD_ACCOUNT_ID);
   const gaConfigured = !!(GA_PROPERTY_ID && GA_SERVICE_ACCOUNT_JSON);
 
   return `
@@ -1316,11 +1102,9 @@ function buildSettingsHtml(shop, tokenData) {
                 <div class="source-desc">Ad spend, impressions, and conversions</div>
               </div>
             </div>
-            ${metaConnected
-              ? `<span class="status-connected">&#10003; Connected${tokenData.metaAdAccountName ? ` (${escapeHtml(tokenData.metaAdAccountName)})` : ""}</span>`
-              : (META_APP_ID
-                ? `<a class="btn-connect" href="/connect/meta?shop=${shopParam}">Connect</a>`
-                : '<span style="color:#6b7177;font-size:13px">Not configured &mdash; add META_APP_ID to env</span>')
+            ${metaConfigured
+              ? '<span class="status-connected">&#10003; Connected (System User)</span>'
+              : '<span style="color:#6b7177;font-size:13px">Not configured &mdash; add META_SYSTEM_USER_TOKEN to env</span>'
             }
           </div>
 
