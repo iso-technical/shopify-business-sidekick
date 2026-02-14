@@ -1250,7 +1250,7 @@ function buildDashboardHtml(storeName, shop, insightsData, isLoading, forceRefre
           if (el) el.innerHTML = '<span class="loading-dot"></span> ' + msgs[i];
         }, 3000);
 
-        fetch("/dashboard/generate?shop=" + encodeURIComponent(shop) + (isRefresh ? "&refresh=1" : ""))
+        fetch("/dashboard/generate?shop=" + encodeURIComponent(shop) + (isRefresh ? "&refresh=1" : ""), { credentials: "include" })
           .then(function(r) { return r.json(); })
           .then(function(data) {
             clearInterval(t);
