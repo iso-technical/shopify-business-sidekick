@@ -940,6 +940,19 @@ function buildDashboardHtml(storeName, shop, insightsData) {
 
     const metaRoas = meta && meta.spend > 0 ? (meta.revenue / meta.spend).toFixed(2) : null;
 
+    // Shopify: orders per day + trend
+    const ordersPerDay = Math.round(stats.orderCount / 30);
+    const orderTrend = ordersPerDay > 100 ? "\ud83d\udcc8" : ordersPerDay < 50 ? "\ud83d\udcc9" : "\u27a1\ufe0f";
+
+    // Analytics: bounce rate insight
+    let bounceInsight = "";
+    if (ga) {
+      const br = ga.bounceRate * 100;
+      if (br < 30) bounceInsight = "Great engagement \u2705";
+      else if (br <= 45) bounceInsight = "Bounce OK \u27a1\ufe0f";
+      else bounceInsight = "High bounce \u26a0\ufe0f";
+    }
+
     freshnessHtml = `
       ${justRefreshed ? '<div class="refresh-flash">\u2705 Insights refreshed</div>' : ""}
       <div class="freshness-cards">
@@ -947,7 +960,7 @@ function buildDashboardHtml(storeName, shop, insightsData) {
           <div class="freshness-card-icon">\ud83d\uded2</div>
           <div class="freshness-card-body">
             <div class="freshness-card-title">Shopify</div>
-            <div class="freshness-card-metric">${stats.orderCount.toLocaleString()} orders</div>
+            <div class="freshness-card-metric">${stats.orderCount.toLocaleString()} orders &middot; ${ordersPerDay}/day ${orderTrend}</div>
             <div class="freshness-card-sub">${dateRange}</div>
           </div>
         </div>
@@ -957,7 +970,7 @@ function buildDashboardHtml(storeName, shop, insightsData) {
             <div class="freshness-card-title">Analytics</div>
             ${ga
               ? `<div class="freshness-card-metric">${ga.sessions.toLocaleString()} sessions</div>
-                 <div class="freshness-card-sub">${(ga.bounceRate * 100).toFixed(1)}% bounce</div>`
+                 <div class="freshness-card-sub">${bounceInsight}</div>`
               : `<div class="freshness-card-metric dim">Not connected</div>`
             }
           </div>
@@ -975,7 +988,7 @@ function buildDashboardHtml(storeName, shop, insightsData) {
         </div>
       </div>
       <div class="freshness-footer">
-        Last updated: ${escapeHtml(updatedLabel)} &middot; <a href="/dashboard?shop=${shopParam}&refresh=1" class="refresh-link">\u2728 Refresh</a>
+        Last updated: ${escapeHtml(updatedLabel)} &middot; <a href="/dashboard?shop=${shopParam}&refresh=1" class="refresh-link" id="refresh-btn" onclick="this.classList.add('loading');this.innerHTML='<span class=\\'refresh-spin\\'>\\ud83d\\udd04</span> Refreshing...';">\u2728 Refresh</a>
       </div>`;
   }
 
@@ -995,6 +1008,27 @@ function buildDashboardHtml(storeName, shop, insightsData) {
     warning: "tile-warning",
     critical: "tile-critical",
   }[tiles.adSeverity] || "tile-healthy") : "tile-healthy";
+
+  // Extract status emoji from tile body text for inline display in label
+  const statusEmojis = ["\ud83d\udfe2", "\ud83d\udfe1", "\ud83d\udd34"];
+  let healthEmoji = "\ud83c\udfe5";
+  let healthBody = tiles?.healthCheck || "";
+  if (tiles) {
+    const match = statusEmojis.find(e => tiles.healthCheck.startsWith(e));
+    if (match) {
+      healthEmoji = match;
+      healthBody = tiles.healthCheck.slice(match.length).trim();
+    }
+  }
+  let adEmoji = "\ud83d\udcb0";
+  let adBody = tiles?.adPerformance || "";
+  if (tiles && tiles.adPerformance) {
+    const match = statusEmojis.find(e => tiles.adPerformance.startsWith(e));
+    if (match) {
+      adEmoji = match;
+      adBody = tiles.adPerformance.slice(match.length).trim();
+    }
+  }
 
   return `
     <!DOCTYPE html>
@@ -1039,14 +1073,17 @@ function buildDashboardHtml(storeName, shop, insightsData) {
         .freshness-card-metric.dim { font-weight: 400; color: #9ca3af; font-size: 13px; }
         .freshness-card-sub { font-size: 12px; color: #6b7280; margin-top: 1px; }
         .freshness-footer { font-size: 12px; color: #6b7280; text-align: center; padding: 8px 0 4px; margin-bottom: 16px; }
-        .refresh-link { color: #008060; text-decoration: none; font-weight: 500; }
+        .refresh-link { color: #008060; text-decoration: none; font-weight: 500; cursor: pointer; }
         .refresh-link:hover { text-decoration: underline; }
+        .refresh-link.loading { pointer-events: none; color: #6b7280; }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        .refresh-link.loading .refresh-spin { display: inline-block; animation: spin 1s linear infinite; }
 
         /* Tile grid */
         .tile-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
         .tile { border-radius: 14px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
         .tile.full { grid-column: 1 / -1; }
-        .tile-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; }
+        .tile-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; display: flex; align-items: center; gap: 6px; }
         .tile-body { font-size: 15px; line-height: 1.7; color: #374151; }
         .tile-body strong { color: #1a1a1a; font-weight: 600; }
 
@@ -1104,8 +1141,8 @@ function buildDashboardHtml(storeName, shop, insightsData) {
         <div class="tile-grid">
 
           <div class="tile ${healthClass} full">
-            <div class="tile-label">\ud83c\udfe5 Health Check</div>
-            <div class="tile-body">${formatTileHtml(tiles.healthCheck)}</div>
+            <div class="tile-label">${healthEmoji} Health Check</div>
+            <div class="tile-body">${formatTileHtml(healthBody)}</div>
           </div>
 
           <div class="tile tile-critical">
@@ -1125,8 +1162,8 @@ function buildDashboardHtml(storeName, shop, insightsData) {
 
           ${tiles.adPerformance ? `
           <div class="tile ${adClass} full">
-            <div class="tile-label">\ud83d\udcb0 Ad Performance</div>
-            <div class="tile-body">${formatTileHtml(tiles.adPerformance)}</div>
+            <div class="tile-label">${adEmoji} Ad Performance</div>
+            <div class="tile-body">${formatTileHtml(adBody)}</div>
           </div>
           ` : ""}
 
