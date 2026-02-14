@@ -641,89 +641,20 @@ app.get("/dashboard", async (req, res) => {
     const shopData = await shopifyFetch(shop, accessToken, "shop");
     const storeName = shopData.shop.name;
 
-    // Generate AI insights server-side (with 24hr cache)
+    // Check insights cache — render immediately (full content if cached, loading skeletons if not)
     let insightsData = null;
     const forceRefresh = req.query.refresh === "1";
 
-    if (ANTHROPIC_API_KEY) {
-      // Check cache first
-      if (!forceRefresh) {
-        insightsData = getCachedInsights(shop);
-        if (insightsData) {
-          console.log("[dashboard] using cached insights from", new Date(insightsData.generatedAt).toISOString());
-        }
-      }
-
-      // Generate fresh if no cache or forced refresh
-      if (!insightsData) {
-        try {
-          console.log("[dashboard] generating fresh insights...");
-
-          const thirtyDaysAgo = new Date();
-          thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-          const sinceDate = thirtyDaysAgo.toISOString();
-
-          // Get exact order count + paginate ALL paid orders for accurate revenue/AOV
-          const countData = await shopifyFetch(
-            shop,
-            accessToken,
-            `orders/count?status=any&created_at_min=${encodeURIComponent(sinceDate)}`
-          );
-          const orderCount = countData.count || 0;
-
-          const allPaidOrders = await fetchAllPaidOrders(shop, accessToken, sinceDate);
-          const paidOrderCount = allPaidOrders.length;
-          const revenue = allPaidOrders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
-          const avgOrderValue = paidOrderCount > 0 ? revenue / paidOrderCount : 0;
-
-          console.log("[dashboard] order count (all):", orderCount, "| paid orders:", paidOrderCount, "| revenue: £" + revenue.toFixed(2), "| AOV: £" + avgOrderValue.toFixed(2));
-
-          const shopifyStats = { orderCount, revenue, avgOrderValue, sampleSize: paidOrderCount, revenueIsEstimated: false };
-
-          // Extract top products from all paid orders
-          const productMap = {};
-          for (const order of allPaidOrders) {
-            for (const item of (order.line_items || [])) {
-              const key = item.title || "Unknown";
-              if (!productMap[key]) productMap[key] = { title: key, revenue: 0, units: 0 };
-              productMap[key].revenue += parseFloat(item.price || 0) * (item.quantity || 1);
-              productMap[key].units += item.quantity || 1;
-            }
-          }
-          const allProducts = Object.values(productMap);
-          const topProducts = {
-            byRevenue: [...allProducts].sort((a, b) => b.revenue - a.revenue).slice(0, 3),
-            byUnits: [...allProducts].sort((a, b) => b.units - a.units).slice(0, 3),
-          };
-          console.log("[dashboard] top products by revenue:", topProducts.byRevenue.map(p => p.title));
-
-          let gaData = null;
-          try {
-            gaData = await fetchGoogleAnalyticsData();
-          } catch (gaErr) {
-            console.log("[dashboard] GA fetch failed (continuing without):", gaErr.message);
-          }
-
-          let metaAdsData = null;
-          try {
-            metaAdsData = await fetchMetaAdsData();
-          } catch (metaErr) {
-            console.log("[dashboard] Meta Ads fetch failed (continuing without):", metaErr.message);
-          }
-
-          const tiles = await generateTileInsights(shopifyStats, gaData, metaAdsData, topProducts);
-
-          insightsData = { tiles, shopifyStats, gaData, metaAdsData };
-          setCachedInsights(shop, insightsData);
-          insightsData = getCachedInsights(shop);
-        } catch (insightsErr) {
-          console.error("[dashboard] insights generation failed:", insightsErr.message);
-          insightsData = null;
-        }
+    if (ANTHROPIC_API_KEY && !forceRefresh) {
+      insightsData = getCachedInsights(shop);
+      if (insightsData) {
+        console.log("[dashboard] using cached insights from", new Date(insightsData.generatedAt).toISOString());
       }
     }
 
-    res.send(buildDashboardHtml(storeName, shop, insightsData));
+    const isLoading = !!ANTHROPIC_API_KEY && !insightsData;
+    console.log("[dashboard] rendering — cached:", !!insightsData, "| loading:", isLoading);
+    res.send(buildDashboardHtml(storeName, shop, insightsData, isLoading, forceRefresh));
   } catch (err) {
     console.error("Dashboard error:", err);
     if (err.message.includes("401")) {
@@ -731,6 +662,100 @@ app.get("/dashboard", async (req, res) => {
       return res.redirect(`/install?shop=${encodeURIComponent(shop)}&error=token_expired`);
     }
     res.status(500).send("Failed to load dashboard. Check server logs.");
+  }
+});
+
+// Dashboard data generation — called async from client-side loading script
+app.get("/dashboard/generate", async (req, res) => {
+  const shop = req.query.shop;
+  const tokenData = shop ? getShopToken(shop) : null;
+
+  if (!shop || !tokenData) {
+    return res.status(401).json({ error: "Not authenticated" });
+  }
+
+  if (!ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured" });
+  }
+
+  const forceRefresh = req.query.refresh === "1";
+
+  // Check cache first (unless force refresh)
+  if (!forceRefresh) {
+    const cached = getCachedInsights(shop);
+    if (cached) {
+      console.log("[generate] returning cached insights");
+      return res.json(cached);
+    }
+  }
+
+  try {
+    const { accessToken } = tokenData;
+    console.log("[generate] generating fresh insights for:", shop);
+
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const sinceDate = thirtyDaysAgo.toISOString();
+
+    // Get exact order count + paginate ALL paid orders for accurate revenue/AOV
+    const countData = await shopifyFetch(
+      shop,
+      accessToken,
+      `orders/count?status=any&created_at_min=${encodeURIComponent(sinceDate)}`
+    );
+    const orderCount = countData.count || 0;
+
+    const allPaidOrders = await fetchAllPaidOrders(shop, accessToken, sinceDate);
+    const paidOrderCount = allPaidOrders.length;
+    const revenue = allPaidOrders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
+    const avgOrderValue = paidOrderCount > 0 ? revenue / paidOrderCount : 0;
+
+    console.log("[generate] orders:", orderCount, "| paid:", paidOrderCount, "| revenue: \u00a3" + revenue.toFixed(2), "| AOV: \u00a3" + avgOrderValue.toFixed(2));
+
+    const shopifyStats = { orderCount, revenue, avgOrderValue, sampleSize: paidOrderCount, revenueIsEstimated: false };
+
+    // Extract top products from all paid orders
+    const productMap = {};
+    for (const order of allPaidOrders) {
+      for (const item of (order.line_items || [])) {
+        const key = item.title || "Unknown";
+        if (!productMap[key]) productMap[key] = { title: key, revenue: 0, units: 0 };
+        productMap[key].revenue += parseFloat(item.price || 0) * (item.quantity || 1);
+        productMap[key].units += item.quantity || 1;
+      }
+    }
+    const allProducts = Object.values(productMap);
+    const topProducts = {
+      byRevenue: [...allProducts].sort((a, b) => b.revenue - a.revenue).slice(0, 3),
+      byUnits: [...allProducts].sort((a, b) => b.units - a.units).slice(0, 3),
+    };
+
+    let gaData = null;
+    try {
+      gaData = await fetchGoogleAnalyticsData();
+    } catch (gaErr) {
+      console.log("[generate] GA fetch failed (continuing without):", gaErr.message);
+    }
+
+    let metaAdsData = null;
+    try {
+      metaAdsData = await fetchMetaAdsData();
+    } catch (metaErr) {
+      console.log("[generate] Meta Ads fetch failed (continuing without):", metaErr.message);
+    }
+
+    const tiles = await generateTileInsights(shopifyStats, gaData, metaAdsData, topProducts);
+
+    const insightsData = { tiles, shopifyStats, gaData, metaAdsData };
+    setCachedInsights(shop, insightsData);
+
+    // Return the cached version (includes generatedAt timestamp)
+    const cached = getCachedInsights(shop);
+    console.log("[generate] insights generated and cached");
+    res.json(cached);
+  } catch (err) {
+    console.error("[generate] error:", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -882,7 +907,7 @@ function formatTileHtml(text) {
     .replace(/\n/g, "<br>");
 }
 
-function buildDashboardHtml(storeName, shop, insightsData) {
+function buildDashboardHtml(storeName, shop, insightsData, isLoading, forceRefresh) {
   const shopParam = encodeURIComponent(shop);
   const now = new Date();
   const thirtyDaysAgo = new Date(now);
@@ -891,12 +916,39 @@ function buildDashboardHtml(storeName, shop, insightsData) {
   const dateTo = now.toLocaleDateString("en-GB", { month: "short", day: "numeric", year: "numeric" });
   const dateRange = `${dateFrom} - ${dateTo}`;
 
-  const forceRefresh = false; // will be checked from query param in route
   const justRefreshed = insightsData && insightsData.generatedAt && (Date.now() - insightsData.generatedAt < 5000);
 
   // Data freshness cards
   let freshnessHtml = "";
-  if (insightsData) {
+  if (isLoading) {
+    freshnessHtml = `
+      <div class="freshness-cards">
+        <div class="freshness-card">
+          <div class="freshness-card-icon" style="opacity:0.3">\ud83d\uded2</div>
+          <div class="freshness-card-body">
+            <div class="skeleton-line" style="width:60px"></div>
+            <div class="skeleton-line" style="width:130px;margin:0"></div>
+          </div>
+        </div>
+        <div class="freshness-card">
+          <div class="freshness-card-icon" style="opacity:0.3">\ud83d\udcca</div>
+          <div class="freshness-card-body">
+            <div class="skeleton-line" style="width:70px"></div>
+            <div class="skeleton-line" style="width:110px;margin:0"></div>
+          </div>
+        </div>
+        <div class="freshness-card">
+          <div class="freshness-card-icon" style="opacity:0.3">\ud83d\udcf1</div>
+          <div class="freshness-card-body">
+            <div class="skeleton-line" style="width:65px"></div>
+            <div class="skeleton-line" style="width:95px;margin:0"></div>
+          </div>
+        </div>
+      </div>
+      <div class="loading-status" id="loading-status">
+        <span class="loading-dot"></span> Connecting to your store\u2026
+      </div>`;
+  } else if (insightsData) {
     const stats = insightsData.shopifyStats;
     const ga = insightsData.gaData;
     const meta = insightsData.metaAdsData;
@@ -1075,6 +1127,15 @@ function buildDashboardHtml(storeName, shop, insightsData) {
         .setup-card h2 { font-size: 18px; margin-bottom: 8px; }
         .setup-card p { color: #6b7280; font-size: 14px; line-height: 1.6; }
 
+        /* Skeleton loading */
+        .tile-skeleton { background: #fff; border: 1px solid #e5e7eb; }
+        .skeleton-line { display: block; height: 14px; background: linear-gradient(90deg, #e5e7eb 25%, #f3f4f6 50%, #e5e7eb 75%); background-size: 200% 100%; border-radius: 4px; margin-bottom: 10px; animation: shimmer 1.5s ease-in-out infinite; }
+        .skeleton-label { width: 100px; height: 12px; background: linear-gradient(90deg, #e5e7eb 25%, #f3f4f6 50%, #e5e7eb 75%); background-size: 200% 100%; border-radius: 4px; animation: shimmer 1.5s ease-in-out infinite; }
+        @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+        .loading-status { text-align: center; padding: 20px 0 8px; font-size: 14px; color: #6b7280; font-weight: 500; margin-bottom: 16px; }
+        .loading-dot { display: inline-block; width: 8px; height: 8px; background: #008060; border-radius: 50%; margin-right: 8px; vertical-align: middle; animation: pulse 1.5s ease-in-out infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+
         @media (max-width: 640px) {
           .tile-grid { grid-template-columns: 1fr; }
           .tile.full { grid-column: 1; }
@@ -1095,7 +1156,39 @@ function buildDashboardHtml(storeName, shop, insightsData) {
 
         ${freshnessHtml}
 
-        ${!ANTHROPIC_API_KEY ? `
+        ${isLoading ? `
+        <div class="tile-grid">
+          <div class="tile tile-skeleton full">
+            <div class="tile-label"><span class="skeleton-label"></span></div>
+            <div class="tile-body">
+              <span class="skeleton-line" style="width:92%"></span>
+              <span class="skeleton-line" style="width:75%"></span>
+              <span class="skeleton-line" style="width:55%"></span>
+            </div>
+          </div>
+          <div class="tile tile-skeleton">
+            <div class="tile-label"><span class="skeleton-label"></span></div>
+            <div class="tile-body">
+              <span class="skeleton-line" style="width:88%"></span>
+              <span class="skeleton-line" style="width:65%"></span>
+            </div>
+          </div>
+          <div class="tile tile-skeleton">
+            <div class="tile-label"><span class="skeleton-label"></span></div>
+            <div class="tile-body">
+              <span class="skeleton-line" style="width:82%"></span>
+              <span class="skeleton-line" style="width:60%"></span>
+            </div>
+          </div>
+          <div class="tile tile-skeleton full">
+            <div class="tile-label"><span class="skeleton-label"></span></div>
+            <div class="tile-body">
+              <span class="skeleton-line" style="width:90%"></span>
+              <span class="skeleton-line" style="width:70%"></span>
+            </div>
+          </div>
+        </div>
+        ` : !ANTHROPIC_API_KEY ? `
         <div class="setup-card">
           <h2>Add your Anthropic API key to get started</h2>
           <p>Set ANTHROPIC_API_KEY in your environment variables to enable AI-powered store insights.</p>
@@ -1138,6 +1231,42 @@ function buildDashboardHtml(storeName, shop, insightsData) {
         `}
 
       </div>
+      ${isLoading ? `
+      <script>
+      (function() {
+        var shop = ${JSON.stringify(shop)};
+        var isRefresh = ${forceRefresh ? "true" : "false"};
+        var el = document.getElementById("loading-status");
+        var msgs = [
+          "Connecting to your store\\u2026",
+          "Fetching order data\\u2026",
+          "Pulling analytics\\u2026",
+          "Generating AI insights\\u2026",
+          "Almost ready\\u2026"
+        ];
+        var i = 0;
+        var t = setInterval(function() {
+          i = Math.min(i + 1, msgs.length - 1);
+          if (el) el.innerHTML = '<span class="loading-dot"></span> ' + msgs[i];
+        }, 3000);
+
+        fetch("/dashboard/generate?shop=" + encodeURIComponent(shop) + (isRefresh ? "&refresh=1" : ""))
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            clearInterval(t);
+            if (data.error) {
+              if (el) el.innerHTML = "\\u26a0\\ufe0f Failed to generate insights. <a href=\\"/dashboard?shop=" + encodeURIComponent(shop) + "&refresh=1\\">Try again</a>";
+              return;
+            }
+            window.location.replace("/dashboard?shop=" + encodeURIComponent(shop));
+          })
+          .catch(function() {
+            clearInterval(t);
+            if (el) el.innerHTML = "\\u26a0\\ufe0f Something went wrong. <a href=\\"/dashboard?shop=" + encodeURIComponent(shop) + "&refresh=1\\">Try again</a>";
+          });
+      })();
+      </script>
+      ` : ""}
     </body>
     </html>
   `;

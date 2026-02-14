@@ -44,7 +44,7 @@
   "data_contracts": {
     "revenue": {
       "canonical_source": "shopify",
-      "definition": "Shopify net sales (total_price from paid orders). NOT GA4 revenue.",
+      "definition": "Shopify gross sales (total_price from paid orders — includes shipping + tax, after discounts, before refunds). NOT GA4 revenue.",
       "note": "All paid orders are paginated — revenue and AOV are exact, not sampled"
     },
     "orders": {
