@@ -170,6 +170,45 @@ async function shopifyFetch(shop, accessToken, endpoint) {
   return res.json();
 }
 
+// Paginate through ALL paid orders for accurate revenue/AOV (Shopify max 250 per page)
+async function fetchAllPaidOrders(shop, accessToken, sinceDate) {
+  const allOrders = [];
+  let url = `https://${shop}/admin/api/2024-01/orders.json?status=any&financial_status=paid&created_at_min=${encodeURIComponent(sinceDate)}&limit=250`;
+
+  while (url) {
+    console.log("[api] GET", url.substring(0, 120) + "...");
+    const res = await fetch(url, {
+      headers: {
+        "X-Shopify-Access-Token": accessToken,
+        "Content-Type": "application/json",
+      },
+    });
+
+    if (!res.ok) {
+      const errBody = await res.text();
+      throw new Error(`Shopify API error ${res.status}: ${errBody.substring(0, 200)}`);
+    }
+
+    const data = await res.json();
+    allOrders.push(...(data.orders || []));
+
+    // Cursor-based pagination via Link header
+    const linkHeader = res.headers.get("link");
+    url = null;
+    if (linkHeader) {
+      const nextMatch = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
+      if (nextMatch) {
+        url = nextMatch[1];
+      }
+    }
+
+    console.log("[api] fetched page:", data.orders?.length || 0, "orders | total so far:", allOrders.length);
+  }
+
+  console.log("[api] pagination complete — total paid orders:", allOrders.length);
+  return allOrders;
+}
+
 async function fetchGoogleAnalyticsData() {
   console.log("[ga-auth] GA_PROPERTY_ID:", GA_PROPERTY_ID || "(not set)");
   console.log("[ga-auth] GA_SERVICE_ACCOUNT_JSON exists:", !!GA_SERVICE_ACCOUNT_JSON);
@@ -226,6 +265,16 @@ async function fetchGoogleAnalyticsData() {
       ],
     },
   });
+
+  // Log diagnostic metadata — helps debug thresholding and sampling issues
+  const metadata = res.data.metadata;
+  if (metadata) {
+    if (metadata.dataLossFromOtherRow) console.warn("[ga] WARNING: dataLossFromOtherRow =", metadata.dataLossFromOtherRow);
+    if (metadata.samplingMetadatas?.length) console.warn("[ga] WARNING: response is SAMPLED:", JSON.stringify(metadata.samplingMetadatas));
+    if (metadata.schemaRestrictionResponse) console.warn("[ga] WARNING: schema restriction (thresholding):", JSON.stringify(metadata.schemaRestrictionResponse));
+  }
+  console.log("[ga] row count:", res.data.rows?.length || 0);
+  console.log("[ga] rowCount (from API):", res.data.rowCount);
 
   const row = res.data.rows?.[0];
   if (!row) {
@@ -614,35 +663,26 @@ app.get("/dashboard", async (req, res) => {
           thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
           const sinceDate = thirtyDaysAgo.toISOString();
 
-          // Get EXACT order count via count endpoint + sample for AOV
-          const [countData, sampleData] = await Promise.all([
-            shopifyFetch(
-              shop,
-              accessToken,
-              `orders/count?status=any&created_at_min=${encodeURIComponent(sinceDate)}`
-            ),
-            shopifyFetch(
-              shop,
-              accessToken,
-              `orders?status=any&financial_status=paid&created_at_min=${encodeURIComponent(sinceDate)}&limit=250`
-            ),
-          ]);
-
+          // Get exact order count + paginate ALL paid orders for accurate revenue/AOV
+          const countData = await shopifyFetch(
+            shop,
+            accessToken,
+            `orders/count?status=any&created_at_min=${encodeURIComponent(sinceDate)}`
+          );
           const orderCount = countData.count || 0;
-          const sampleOrders = sampleData.orders || [];
-          const sampleSize = sampleOrders.length;
-          const sampleRevenue = sampleOrders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
-          const avgOrderValue = sampleSize > 0 ? sampleRevenue / sampleSize : 0;
-          const revenueIsEstimated = sampleSize < orderCount;
-          const revenue = revenueIsEstimated ? avgOrderValue * orderCount : sampleRevenue;
 
-          console.log("[dashboard] order count (exact):", orderCount, "| sample:", sampleSize, "| AOV:", avgOrderValue.toFixed(2), "| revenue estimated:", revenueIsEstimated);
+          const allPaidOrders = await fetchAllPaidOrders(shop, accessToken, sinceDate);
+          const paidOrderCount = allPaidOrders.length;
+          const revenue = allPaidOrders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
+          const avgOrderValue = paidOrderCount > 0 ? revenue / paidOrderCount : 0;
 
-          const shopifyStats = { orderCount, revenue, avgOrderValue, sampleSize, revenueIsEstimated };
+          console.log("[dashboard] order count (all):", orderCount, "| paid orders:", paidOrderCount, "| revenue: £" + revenue.toFixed(2), "| AOV: £" + avgOrderValue.toFixed(2));
 
-          // Extract top products from sample orders
+          const shopifyStats = { orderCount, revenue, avgOrderValue, sampleSize: paidOrderCount, revenueIsEstimated: false };
+
+          // Extract top products from all paid orders
           const productMap = {};
-          for (const order of sampleOrders) {
+          for (const order of allPaidOrders) {
             for (const item of (order.line_items || [])) {
               const key = item.title || "Unknown";
               if (!productMap[key]) productMap[key] = { title: key, revenue: 0, units: 0 };
@@ -727,33 +767,24 @@ app.get("/insights", async (req, res) => {
     const sinceDate = thirtyDaysAgo.toISOString();
 
     console.log("[insights] fetching Shopify order stats since:", sinceDate);
-    const [countData, sampleData] = await Promise.all([
-      shopifyFetch(
-        shop,
-        accessToken,
-        `orders/count?status=any&created_at_min=${encodeURIComponent(sinceDate)}`
-      ),
-      shopifyFetch(
-        shop,
-        accessToken,
-        `orders?status=any&financial_status=paid&created_at_min=${encodeURIComponent(sinceDate)}&limit=250`
-      ),
-    ]);
-
+    const countData = await shopifyFetch(
+      shop,
+      accessToken,
+      `orders/count?status=any&created_at_min=${encodeURIComponent(sinceDate)}`
+    );
     const orderCount = countData.count || 0;
-    const sampleOrders = sampleData.orders || [];
-    const sampleSize = sampleOrders.length;
-    const sampleRevenue = sampleOrders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
-    const avgOrderValue = sampleSize > 0 ? sampleRevenue / sampleSize : 0;
-    const revenueIsEstimated = sampleSize < orderCount;
-    const revenue = revenueIsEstimated ? avgOrderValue * orderCount : sampleRevenue;
 
-    const shopifyStats = { orderCount, revenue, avgOrderValue, sampleSize, revenueIsEstimated };
+    const allPaidOrders = await fetchAllPaidOrders(shop, accessToken, sinceDate);
+    const paidOrderCount = allPaidOrders.length;
+    const revenue = allPaidOrders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
+    const avgOrderValue = paidOrderCount > 0 ? revenue / paidOrderCount : 0;
+
+    const shopifyStats = { orderCount, revenue, avgOrderValue, sampleSize: paidOrderCount, revenueIsEstimated: false };
     console.log("[insights] shopify stats:", shopifyStats);
 
-    // Extract top products from sample orders
+    // Extract top products from all paid orders
     const productMap = {};
-    for (const order of sampleOrders) {
+    for (const order of allPaidOrders) {
       for (const item of (order.line_items || [])) {
         const key = item.title || "Unknown";
         if (!productMap[key]) productMap[key] = { title: key, revenue: 0, units: 0 };
@@ -884,8 +915,8 @@ function buildDashboardHtml(storeName, shop, insightsData) {
     let bounceInsight = "";
     if (ga) {
       const br = ga.bounceRate * 100;
-      if (br < 30) bounceInsight = "Great engagement \u2705";
-      else if (br <= 45) bounceInsight = "Bounce OK \u27a1\ufe0f";
+      if (br < 40) bounceInsight = "Great engagement \u2705";
+      else if (br <= 65) bounceInsight = "Bounce OK \u27a1\ufe0f";
       else bounceInsight = "High bounce \u26a0\ufe0f";
     }
 

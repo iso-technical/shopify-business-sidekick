@@ -2,7 +2,7 @@
   "business_profile": {
     "store_name": "ISOCLEAN",
     "industry": "beauty-and-cleaning",
-    "aov_band": "£20-40",
+    "aov_band": "£18-25",
     "margin_model": "55-70% gross margin",
     "currency": "GBP",
     "currency_symbol": "£",
@@ -25,7 +25,7 @@
     "revenue": {
       "formula": "Sessions × CVR × AOV",
       "drivers": {
-        "sessions": { "source": "ga4", "levers": ["SEO", "paid traffic", "email", "social"] },
+        "sessions": { "source": "ga4", "levers": ["SEO", "paid traffic (Meta, TikTok)", "email", "social", "direct"] },
         "cvr": { "source": "derived", "formula": "Shopify orders / GA4 sessions", "note": "Cross-source — treat as directional only" },
         "aov": { "source": "shopify", "levers": ["bundling", "upsells", "price increases", "free shipping threshold"] }
       }
@@ -45,7 +45,7 @@
     "revenue": {
       "canonical_source": "shopify",
       "definition": "Shopify net sales (total_price from paid orders). NOT GA4 revenue.",
-      "note": "When orders > 250, revenue is estimated as AOV × order count"
+      "note": "All paid orders are paginated — revenue and AOV are exact, not sampled"
     },
     "orders": {
       "canonical_source": "shopify",
@@ -77,9 +77,10 @@
       "window": "7-day click, 1-day view",
       "note": "Meta's attribution is generous. Always cross-reference with Shopify."
     },
+    "expected_paid_meta_percentage": 40,
     "discrepancy_flag": {
-      "threshold_pct": 30,
-      "rule": "If Meta-reported purchases differ from Shopify orders by more than 30%, flag the discrepancy and note which number is being used."
+      "threshold_pct": 50,
+      "rule": "Meta accounts for ~40% of orders. Only flag if Meta-reported purchases drop significantly below the expected 40% share of Shopify orders (i.e. below 20% share), suggesting tracking or attribution issues."
     }
   },
 
@@ -87,6 +88,13 @@
     "roas_goal": 3.0,
     "cac_ceiling": 10,
     "mer_goal": 4.0
+  },
+
+  "data_source_notes": {
+    "ga4_sessions": "Shopify reports higher session counts than GA4 due to Google Signals thresholding, cookie consent, and ad blockers. GA4 sessions are used for conversion rate calculations but are likely undercounted.",
+    "revenue_source_of_truth": "Shopify gross sales (total_price from paid orders) are the revenue source of truth. GA4 revenue is NOT used.",
+    "multi_channel": "Meta Ads accounts for ~40% of orders. Remaining 60% comes from TikTok, email, organic, and direct. Do not expect Meta purchases to match total Shopify orders.",
+    "order_pagination": "All paid orders are paginated from the Shopify REST API — revenue and AOV are exact totals, not sampled from 250 orders."
   },
 
   "seasonality_calendar": [],

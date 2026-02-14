@@ -275,9 +275,9 @@ function validateBusinessContext(businessContext, dataSummary) {
     }
   }
 
-  // 5. CPA vs CAC ceiling check
-  if (targets.cac_ceiling && dataSummary.meta_ads && dataSummary.meta_ads.spend > 0 && s.orders > 0) {
-    const actualCpa = dataSummary.meta_ads.spend / s.orders;
+  // 5. CPA vs CAC ceiling check (using Meta purchases, not total Shopify orders)
+  if (targets.cac_ceiling && dataSummary.meta_ads && dataSummary.meta_ads.spend > 0 && dataSummary.meta_ads.purchases > 0) {
+    const actualCpa = dataSummary.meta_ads.spend / dataSummary.meta_ads.purchases;
     if (actualCpa > targets.cac_ceiling) {
       const overBy = ((actualCpa / targets.cac_ceiling - 1) * 100).toFixed(0);
       if (actualCpa > targets.cac_ceiling * 2) {
@@ -285,6 +285,17 @@ function validateBusinessContext(businessContext, dataSummary) {
       } else {
         notes.push(`CPA is \u00a3${actualCpa.toFixed(2)}, which is ${overBy}% above your \u00a3${targets.cac_ceiling} CAC ceiling. Worth investigating whether this is a recent spike or a consistent pattern.`);
       }
+    }
+  }
+
+  // 6. Meta attribution share check — flag if Meta's share drops well below expected baseline
+  const ar = businessContext.attribution_rules;
+  if (ar.expected_paid_meta_percentage && dataSummary.meta_ads && dataSummary.meta_ads.purchases > 0 && s.orders > 0) {
+    const metaSharePct = (dataSummary.meta_ads.purchases / s.orders) * 100;
+    const expectedPct = ar.expected_paid_meta_percentage;
+    const floorPct = expectedPct * 0.5; // flag if below 50% of expected share
+    if (metaSharePct < floorPct) {
+      notes.push(`Meta accounts for only ${metaSharePct.toFixed(1)}% of orders (${dataSummary.meta_ads.purchases} of ${s.orders.toLocaleString()}) \u2014 well below the expected ~${expectedPct}% baseline. Possible pixel/CAPI tracking issue or attribution window change.`);
     }
   }
 
