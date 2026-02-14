@@ -132,7 +132,7 @@ function buildContentHtml(insightsData, shop) {
       </div>
     </div>
     <div class="freshness-footer">
-      Last updated: ${escapeHtml(updatedLabel)} &middot; <a href="/dashboard?shop=${shopParam}&refresh=1" class="refresh-link" id="refresh-btn" onclick="this.classList.add('loading');this.innerHTML='<span class=\\'refresh-spin\\'>\\ud83d\\udd04</span> Refreshing...';">\u2728 Refresh</a>
+      Last updated: ${escapeHtml(updatedLabel)} &middot; <a href="/dashboard?shop=${shopParam}&refresh=1" class="refresh-link" id="refresh-btn" onclick="this.classList.add('loading');this.textContent='Refreshing\\u2026';">\u2728 Refresh</a>
     </div>`;
 
   const tiles = insightsData.tiles;

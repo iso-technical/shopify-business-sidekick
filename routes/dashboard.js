@@ -23,9 +23,6 @@ router.get("/dashboard", async (req, res) => {
   const { accessToken } = tokenData;
 
   try {
-    logger.info("[dashboard] fetching data for shop:", shop);
-    const shopData = await shopifyFetch(shop, accessToken, "shop");
-    const storeName = shopData.shop.name;
     const forceRefresh = req.query.refresh === "1";
 
     // Force refresh clears both caches so order data is also re-fetched
@@ -34,6 +31,7 @@ router.get("/dashboard", async (req, res) => {
       clearOrderDataCache(shop);
     }
 
+    // Check cache BEFORE any API calls — avoids blocking on shopifyFetch for cache misses
     let insightsData = null;
     if (config.ANTHROPIC_API_KEY && !forceRefresh) {
       insightsData = getCachedInsights(shop);
@@ -42,34 +40,48 @@ router.get("/dashboard", async (req, res) => {
       }
     }
 
-    // Cache hit or no API key — render full page immediately
+    // Cache hit or no API key — fetch store name then render full page
     if (insightsData || !config.ANTHROPIC_API_KEY) {
+      const shopData = await shopifyFetch(shop, accessToken, "shop");
+      const storeName = shopData.shop.name;
       logger.info("[dashboard] rendering full page (cached:", !!insightsData, ")");
       return res.send(buildDashboardHtml(storeName, shop, insightsData));
     }
 
-    // Cache miss — stream skeleton page, then swap in real content when ready
+    // Cache miss — send skeleton IMMEDIATELY before any data fetching
     logger.info("[dashboard] cache miss \u2014 streaming skeleton + generating insights");
+    const placeholderName = shop.replace(".myshopify.com", "")
+      .split("-").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.flushHeaders();
-
-    res.write(buildSkeletonHtml(storeName, shop));
+    res.write(buildSkeletonHtml(placeholderName, shop));
 
     try {
-      const orderData = await getShopifyOrderData(shop, accessToken);
-
-      const [gaData, metaAdsData] = await Promise.all([
+      // Fetch store name, order data, GA, and Meta all in parallel
+      const [shopData, orderData, gaData, metaAdsData] = await Promise.all([
+        shopifyFetch(shop, accessToken, "shop"),
+        getShopifyOrderData(shop, accessToken),
         fetchGoogleAnalyticsData().catch(err => { logger.info("[dashboard] GA failed:", err.message); return null; }),
         fetchMetaAdsData().catch(err => { logger.info("[dashboard] Meta failed:", err.message); return null; }),
       ]);
 
+      const storeName = shopData.shop.name;
       const tiles = await generateTileInsights(orderData.shopifyStats, gaData, metaAdsData, orderData.topProducts);
       const newInsights = { tiles, shopifyStats: orderData.shopifyStats, gaData, metaAdsData };
       setCachedInsights(shop, newInsights);
 
       const cached = getCachedInsights(shop);
       const contentHtml = buildContentHtml(cached, shop);
-      res.write("<script>(function(){var c=document.getElementById('dashboard-content');if(c)c.innerHTML=" + JSON.stringify(contentHtml) + ";if(window.__li)clearInterval(window.__li);if(window.__lt)clearTimeout(window.__lt);})();</script>");
+
+      // Swap content, update store name in topbar/title, and clear loading timers
+      const safeStoreName = JSON.stringify(storeName);
+      res.write("<script>(function(){" +
+        "var c=document.getElementById('dashboard-content');if(c)c.innerHTML=" + JSON.stringify(contentHtml) + ";" +
+        "document.title='Dashboard \\u2014 '+" + safeStoreName + ";" +
+        "var b=document.querySelector('.connected-bar');if(b)b.innerHTML='Connected to: <strong>'+" + safeStoreName + "+'</strong> (" + shop.replace(/'/g, "\\'") + ")';" +
+        "if(window.__li)clearInterval(window.__li);if(window.__lt)clearTimeout(window.__lt);" +
+        "})();</script>");
       logger.info("[dashboard] streamed real content");
     } catch (genErr) {
       logger.error("[dashboard] generation error:", genErr.message);
