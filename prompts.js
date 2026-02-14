@@ -37,10 +37,14 @@ ${targets.mer_goal ? `- MER goal: ${targets.mer_goal}x` : ""}
    - Sessions = ${dc.sessions.definition}
    - Conversion rate = ${dc.conversion_rate.definition} (${dc.conversion_rate.warning})
    - ROAS = ${dc.roas.definition} (${dc.roas.warning})
-3. CROSS-SOURCE VALIDATION — ${ar.discrepancy_flag.rule}
-4. PATTERN DETECTION — Find the biggest signal in the data. What's working? What's broken?
-5. ROOT CAUSE HYPOTHESIS — Why is that pattern happening? Name the specific driver.
-6. ACTION PRESCRIPTION — One specific action per tile. Name the product, page, or campaign.
+3. DRIVER TREE DECOMPOSITION — When a metric is good or bad, explain WHY using its driver tree:
+   - Revenue = Sessions × CVR × AOV. Which driver is responsible? e.g. "Revenue is strong because AOV is up, but sessions are flat — traffic is the bottleneck."
+   - Ad Efficiency: ROAS is driven by CPC, CTR, and CPA. e.g. "ROAS is low because CPC is £1.20 with only 2.4% CTR — creative isn't converting clicks."
+   - Never just state a metric value. Always name the driver behind it.
+4. CROSS-SOURCE VALIDATION — ${ar.discrepancy_flag.rule}
+5. PATTERN DETECTION — Find the biggest signal in the data. What's working? What's broken?
+6. ROOT CAUSE HYPOTHESIS — Why is that pattern happening? Name the specific driver from the tree.
+7. ACTION PRESCRIPTION — One specific action per tile. Name the product, page, or campaign.
 
 ## Safety Rails
 - ${rails.minimum_purchases.rule}
@@ -57,7 +61,8 @@ ${targets.mer_goal ? `- MER goal: ${targets.mer_goal}x` : ""}
 - Format positives as: [Current state] → [Action] = [Expected result]
 - Use SPECIFIC product names from the data. Never say "your products" — name them.
 - If revenue is estimated, note with ~ prefix.
-- Do NOT present cross-source conversion rate as exact — it's directional only.`;
+- Do NOT present cross-source conversion rate as exact — it's directional only.
+- Every tile MUST end with **Confidence: [High/Medium/Low]** and a one-sentence justification. Base confidence on: data volume (more orders = higher), data freshness, whether revenue is estimated, and whether cross-source metrics are involved (cross-source = lower confidence).`;
 }
 
 // --- Data Summary Builder ---
@@ -122,21 +127,31 @@ function buildDataSummary(shopifyStats, gaData, metaAdsData, topProducts) {
 const TILE_PROMPTS = {
   HEALTH_CHECK: `### HEALTH CHECK
 Start with EXACTLY one status emoji: 🟢 (healthy), 🟡 (needs attention), or 🔴 (critical).
-One-line verdict. Then 3 key metrics on new lines: Revenue, Orders, AOV — each with brief context.
-Every metric must include an improvement action. 40 words max total.`,
+One-line verdict. Then 3 key metrics on new lines: Revenue, Orders, AOV — for each, name the driver behind it (e.g. "AOV £32 — pulled up by Brush Cleaner bundles" or "Revenue flat — sessions growing but AOV dropped £4").
+Every metric must include an improvement action targeting the weakest driver.
+End with: **Confidence: [High/Medium/Low]** — one sentence why (e.g. "High — 3,400+ orders gives solid signal" or "Medium — revenue is estimated from 250-order sample").
+50 words max total.`,
 
   BIGGEST_ISSUE: `### BIGGEST ISSUE
-The #1 thing costing money right now. Name the specific problem, the £ impact, and one fix. Be blunt. 30 words max.`,
+The #1 thing costing money right now. Use the driver tree to pinpoint the root cause — don't just say "revenue is low", say which driver (sessions, CVR, or AOV) is dragging it down and why. Name the £ impact and one fix.
+End with: **Confidence: [High/Medium/Low]** — one sentence why.
+40 words max.`,
 
   QUICK_WIN: `### QUICK WIN
-One specific action for THIS WEEK. Name the product/page/campaign. What to do and expected £ impact. 30 words max.`,
+One specific action for THIS WEEK. Name the product/page/campaign. Connect it to a driver: which part of Revenue = Sessions × CVR × AOV does this improve? What's the expected £ impact?
+End with: **Confidence: [High/Medium/Low]** — one sentence why.
+40 words max.`,
 
   OPPORTUNITY: `### OPPORTUNITY
-One growth pattern from the data. Name specific products. Recommendation with realistic £ potential over 30 days. 30 words max.`,
+One growth pattern from the data. Name specific products. Which revenue driver does this leverage (traffic, conversion, or basket size)? Recommendation with realistic £ potential over 30 days.
+End with: **Confidence: [High/Medium/Low]** — one sentence why.
+40 words max.`,
 
   AD_PERFORMANCE: `### AD PERFORMANCE
 Start with EXACTLY one status emoji: 🟢 (ROAS >2.5), 🟡 (ROAS 1.5-2.5), or 🔴 (ROAS <1.5).
-ROAS value, verdict, and one specific optimization. Name what to change. 30 words max.`,
+ROAS value, then decompose: is the issue CPC (cost per click too high), CTR (ads not getting clicks), or CPA (clicks not converting)? Name the weakest driver and one specific optimization.
+End with: **Confidence: [High/Medium/Low]** — one sentence why.
+40 words max.`,
 };
 
 // --- Full Tile Prompt Builder ---
@@ -252,7 +267,15 @@ function validateBusinessContext(businessContext, dataSummary) {
     }
   }
 
-  // 4. CPA vs CAC ceiling check
+  // 4. Conversion rate anomaly check (cross-source: Shopify orders / GA4 sessions)
+  if (dataSummary.ga4 && dataSummary.ga4.sessions > 0 && s.orders > 0) {
+    const cvr = (s.orders / dataSummary.ga4.sessions) * 100;
+    if (cvr > 20) {
+      notes.push(`Cross-source conversion rate is ${cvr.toFixed(1)}% (${s.orders.toLocaleString()} orders from ${dataSummary.ga4.sessions.toLocaleString()} sessions) \u2014 this is unrealistically high. GA4 is likely undercounting sessions (check tracking snippet, cookie consent, or ad blockers). Do NOT use this conversion rate in your analysis \u2014 treat it as a data integrity issue, not a real metric.`);
+    }
+  }
+
+  // 5. CPA vs CAC ceiling check
   if (targets.cac_ceiling && dataSummary.meta_ads && dataSummary.meta_ads.spend > 0 && s.orders > 0) {
     const actualCpa = dataSummary.meta_ads.spend / s.orders;
     if (actualCpa > targets.cac_ceiling) {

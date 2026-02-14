@@ -337,7 +337,7 @@ async function generateTileInsights(shopifyStats, gaData, metaAdsData, topProduc
 
   const message = await client.messages.create({
     model: "claude-sonnet-4-5-20250929",
-    max_tokens: hasMetaAds ? 800 : 600,
+    max_tokens: hasMetaAds ? 1000 : 800,
     system: systemPrompt,
     messages: [{ role: "user", content: userPrompt }],
   });
