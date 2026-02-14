@@ -1,0 +1,112 @@
+{
+  "business_profile": {
+    "store_name": "ISOCLEAN",
+    "industry": "beauty-and-cleaning",
+    "aov_band": "£20-40",
+    "margin_model": "55-70% gross margin",
+    "currency": "GBP",
+    "currency_symbol": "£",
+    "hero_products": ["Makeup Brush Cleaner with Spray Top", "Hypochlorous Spray", "Cotton Cleansing Towels"],
+    "business_stage": "growth",
+    "primary_market": "UK"
+  },
+
+  "funnel_definition": {
+    "stages": [
+      { "name": "Sessions", "source": "ga4", "metric": "sessions" },
+      { "name": "Product Views", "source": "ga4", "metric": "screenPageViews", "note": "Approximated from page views — no enhanced ecommerce" },
+      { "name": "Add to Cart", "source": "shopify", "metric": "checkouts_count", "note": "Not available via basic API — placeholder" },
+      { "name": "Checkout", "source": "shopify", "metric": "checkouts_count", "note": "Not available via basic API — placeholder" },
+      { "name": "Purchase", "source": "shopify", "metric": "orders_count" }
+    ]
+  },
+
+  "metric_trees": {
+    "revenue": {
+      "formula": "Sessions × CVR × AOV",
+      "drivers": {
+        "sessions": { "source": "ga4", "levers": ["SEO", "paid traffic", "email", "social"] },
+        "cvr": { "source": "derived", "formula": "Shopify orders / GA4 sessions", "note": "Cross-source — treat as directional only" },
+        "aov": { "source": "shopify", "levers": ["bundling", "upsells", "price increases", "free shipping threshold"] }
+      }
+    },
+    "ad_efficiency": {
+      "formula": "ROAS = Shopify revenue attributed / Meta spend",
+      "drivers": {
+        "roas": { "source": "derived", "formula": "Shopify revenue / Meta spend" },
+        "cpc": { "source": "meta", "formula": "Spend / Clicks" },
+        "ctr": { "source": "meta", "formula": "Clicks / Impressions" },
+        "cpa": { "source": "derived", "formula": "Meta spend / Shopify orders" }
+      }
+    }
+  },
+
+  "data_contracts": {
+    "revenue": {
+      "canonical_source": "shopify",
+      "definition": "Shopify net sales (total_price from paid orders). NOT GA4 revenue.",
+      "note": "When orders > 250, revenue is estimated as AOV × order count"
+    },
+    "orders": {
+      "canonical_source": "shopify",
+      "definition": "Shopify order count via /orders/count endpoint (exact)"
+    },
+    "sessions": {
+      "canonical_source": "ga4",
+      "definition": "GA4 sessions from the last 30 days"
+    },
+    "conversion_rate": {
+      "canonical_source": "derived",
+      "definition": "Shopify orders / GA4 sessions",
+      "warning": "Cross-source metric — directional only. Do NOT present as exact."
+    },
+    "roas": {
+      "canonical_source": "derived",
+      "definition": "Shopify revenue / Meta ad spend",
+      "warning": "NOT Meta's self-reported ROAS. Uses Shopify revenue as the source of truth."
+    }
+  },
+
+  "attribution_rules": {
+    "traffic": {
+      "source": "ga4",
+      "model": "GA4 default (last click)"
+    },
+    "ad_conversions": {
+      "source": "meta",
+      "window": "7-day click, 1-day view",
+      "note": "Meta's attribution is generous. Always cross-reference with Shopify."
+    },
+    "discrepancy_flag": {
+      "threshold_pct": 30,
+      "rule": "If Meta-reported purchases differ from Shopify orders by more than 30%, flag the discrepancy and note which number is being used."
+    }
+  },
+
+  "targets_and_constraints": {
+    "roas_goal": 3.0,
+    "cac_ceiling": 10,
+    "mer_goal": 4.0
+  },
+
+  "seasonality_calendar": [],
+
+  "trust_and_safety_rails": {
+    "session_drop_flag": {
+      "threshold_pct": 40,
+      "rule": "Flag if sessions drop more than 40% day-over-day — likely a tracking issue, not a real traffic drop"
+    },
+    "revenue_gap_flag": {
+      "threshold_pct": 20,
+      "rule": "Flag if GA4 revenue and Shopify revenue differ by more than 20% — data integrity issue"
+    },
+    "minimum_purchases": {
+      "count": 30,
+      "rule": "Do not draw conclusions about conversion rates or product performance with fewer than 30 purchases"
+    },
+    "minimum_trend_days": {
+      "days": 7,
+      "rule": "Do not call something a trend with fewer than 7 days of data"
+    }
+  }
+}

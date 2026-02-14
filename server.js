@@ -2,6 +2,8 @@ require("dotenv").config();
 const express = require("express");
 const crypto = require("crypto");
 const session = require("express-session");
+const { buildSystemPrompt, buildDataSummary, buildTilePrompt, validateBusinessContext } = require("./prompts");
+const businessContext = require("./business-context.json");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -316,94 +318,28 @@ async function generateTileInsights(shopifyStats, gaData, metaAdsData, topProduc
   const Anthropic = require("@anthropic-ai/sdk");
   const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
-  // Build shared data context
-  let dataContext = `Store data from the last 30 days:\n`;
-  dataContext += `Orders: ${shopifyStats.orderCount.toLocaleString()} (exact count)\n`;
-  dataContext += `Average order value: \u00a3${shopifyStats.avgOrderValue.toFixed(2)} (based on ${shopifyStats.sampleSize} order sample)\n`;
-  if (shopifyStats.revenueIsEstimated) {
-    dataContext += `Estimated revenue: ~\u00a3${shopifyStats.revenue.toFixed(2)} (AOV \u00d7 order count)\n`;
-  } else {
-    dataContext += `Revenue: \u00a3${shopifyStats.revenue.toFixed(2)}\n`;
-  }
-
-  if (gaData) {
-    dataContext += `Website sessions: ${gaData.sessions.toLocaleString()}\n`;
-    dataContext += `Bounce rate: ${(gaData.bounceRate * 100).toFixed(1)}%\n`;
-    dataContext += `Unique visitors: ${gaData.users.toLocaleString()}\n`;
-    dataContext += `Page views: ${gaData.pageViews.toLocaleString()}\n`;
-  } else {
-    dataContext += `Website analytics: Not connected\n`;
-  }
-
-  if (metaAdsData) {
-    dataContext += `\nMeta Ads (last 30 days):\n`;
-    dataContext += `Ad spend: \u00a3${metaAdsData.spend.toFixed(2)}\n`;
-    dataContext += `Impressions: ${metaAdsData.impressions.toLocaleString()}\n`;
-    dataContext += `Clicks: ${metaAdsData.clicks.toLocaleString()}\n`;
-    dataContext += `Purchases from ads: ${metaAdsData.purchases}\n`;
-    dataContext += `Revenue from ads: \u00a3${metaAdsData.revenue.toFixed(2)}\n`;
-    const roas = metaAdsData.spend > 0 ? (metaAdsData.revenue / metaAdsData.spend).toFixed(2) : "N/A";
-    dataContext += `ROAS: ${roas}x\n`;
-  } else {
-    dataContext += `Meta Ads: Not connected\n`;
-  }
-
-  // Add top products context
-  if (topProducts) {
-    if (topProducts.byRevenue.length > 0) {
-      dataContext += `\nTop products by revenue:\n`;
-      topProducts.byRevenue.forEach((p, i) => {
-        dataContext += `${i + 1}. ${p.title} \u2014 \u00a3${p.revenue.toFixed(2)} (${p.units} units)\n`;
-      });
-    }
-    if (topProducts.byUnits.length > 0) {
-      dataContext += `\nTop products by units sold:\n`;
-      topProducts.byUnits.forEach((p, i) => {
-        dataContext += `${i + 1}. ${p.title} \u2014 ${p.units} units (\u00a3${p.revenue.toFixed(2)})\n`;
-      });
-    }
-  }
-
+  // Build structured data summary and prompts from business context
+  const dataSummary = buildDataSummary(shopifyStats, gaData, metaAdsData, topProducts);
   const hasMetaAds = !!metaAdsData;
+  const systemPrompt = buildSystemPrompt(businessContext);
+  let userPrompt = buildTilePrompt(dataSummary, hasMetaAds);
 
-  const prompt = `You're a sharp e-commerce advisor. Concise, data-driven, actionable.
+  // Context validation — compare live data against business-context.json
+  const contextNotes = validateBusinessContext(businessContext, dataSummary);
+  if (contextNotes.length > 0) {
+    console.log("[insights] context validation notes:", contextNotes);
+    const contextBlock = "\nCONTEXT NOTES (acknowledge these briefly at the start of HEALTH CHECK):\n" +
+      contextNotes.map(n => `- ${n}`).join("\n") + "\n";
+    userPrompt = contextBlock + "\n" + userPrompt;
+  }
 
-${dataContext}
-STRICT RULES:
-- Do NOT calculate conversion rate (orders \u00f7 sessions) \u2014 the data sources aren't linked
-- Use \u00a3 for currency. If revenue is estimated, note with ~ prefix
-- Use emoji STRATEGICALLY only: \ud83d\udcc8\ud83d\udcc9 trends, \ud83d\udcb0 money, \u26a0\ufe0f problems, \u2705 wins, \ud83c\udfaf actions
-- No filler words. Every sentence must be actionable or data-driven
-- NEVER just celebrate wins. Every positive MUST include "but here's how to go further"
-- Format positives as: [Current state] \u2192 [Action] = [Expected result]
-- Use SPECIFIC product names from the data. Never say "your products" \u2014 name them
-${hasMetaAds ? "- ROAS = Revenue from ads \u00f7 Ad spend. Use this to assess ad efficiency\n" : ""}
-Respond with EXACTLY these ${hasMetaAds ? "5" : "4"} sections using ### headers:
-
-### HEALTH CHECK
-Start with EXACTLY one status emoji: \ud83d\udfe2 (healthy), \ud83d\udfe1 (needs attention), or \ud83d\udd34 (critical).
-One-line verdict. Then 3 key metrics on new lines: Revenue, Orders, AOV \u2014 each with brief context.
-Every metric must include an improvement action. 40 words max total.
-
-### BIGGEST ISSUE
-The #1 thing costing money right now. Name the specific problem, the \u00a3 impact, and one fix. Be blunt. 30 words max.
-
-### QUICK WIN
-One specific action for THIS WEEK. Name the product/page/campaign. What to do and expected \u00a3 impact. 30 words max.
-
-### OPPORTUNITY
-One growth pattern from the data. Name specific products. Recommendation with realistic \u00a3 potential over 30 days. 30 words max.${hasMetaAds ? `
-
-### AD PERFORMANCE
-Start with EXACTLY one status emoji: \ud83d\udfe2 (ROAS >2.5), \ud83d\udfe1 (ROAS 1.5-2.5), or \ud83d\udd34 (ROAS <1.5).
-ROAS value, verdict, and one specific optimization. Name what to change. 30 words max.` : ""}`;
-
-  console.log("[insights] sending tile prompt to Claude...");
+  console.log("[insights] sending tile prompt to Claude (system + user prompt)...");
 
   const message = await client.messages.create({
     model: "claude-sonnet-4-5-20250929",
     max_tokens: hasMetaAds ? 800 : 600,
-    messages: [{ role: "user", content: prompt }],
+    system: systemPrompt,
+    messages: [{ role: "user", content: userPrompt }],
   });
 
   const text = message.content[0]?.text || "";
