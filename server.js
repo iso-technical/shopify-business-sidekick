@@ -44,6 +44,7 @@ function setShopToken(shop, accessToken) {
 function deleteShopToken(shop) {
   delete shopTokens[shop];
   delete insightsCache[shop];
+  delete orderDataCache[shop];
   console.log("[store] deleted token for", shop);
 }
 
@@ -61,6 +62,26 @@ function getCachedInsights(shop) {
 function setCachedInsights(shop, data) {
   insightsCache[shop] = { ...data, generatedAt: Date.now() };
   console.log("[cache] saved insights for", shop);
+}
+
+// In-memory order data cache keyed by shop domain (24hr TTL)
+// Caches derived stats so Shopify order pagination only runs once per day
+const orderDataCache = {};
+const ORDER_DATA_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+function getCachedOrderData(shop) {
+  const cached = orderDataCache[shop];
+  if (!cached) return null;
+  if (Date.now() - cached.cachedAt > ORDER_DATA_TTL) {
+    delete orderDataCache[shop];
+    return null;
+  }
+  return cached;
+}
+
+function setCachedOrderData(shop, data) {
+  orderDataCache[shop] = { ...data, cachedAt: Date.now() };
+  console.log("[cache] saved order data for", shop);
 }
 
 app.use(express.json());
@@ -207,6 +228,51 @@ async function fetchAllPaidOrders(shop, accessToken, sinceDate) {
 
   console.log("[api] pagination complete — total paid orders:", allOrders.length);
   return allOrders;
+}
+
+// Get order data — checks 24hr cache first, falls back to API pagination
+async function getShopifyOrderData(shop, accessToken) {
+  const cached = getCachedOrderData(shop);
+  if (cached) {
+    console.log("[orders] using cached order data from", new Date(cached.cachedAt).toISOString());
+    return cached;
+  }
+
+  console.log("[orders] cache miss — paginating all paid orders...");
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  const sinceDate = thirtyDaysAgo.toISOString();
+
+  const countData = await shopifyFetch(shop, accessToken, `orders/count?status=any&created_at_min=${encodeURIComponent(sinceDate)}`);
+  const orderCount = countData.count || 0;
+
+  const allPaidOrders = await fetchAllPaidOrders(shop, accessToken, sinceDate);
+  const paidOrderCount = allPaidOrders.length;
+  const revenue = allPaidOrders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
+  const avgOrderValue = paidOrderCount > 0 ? revenue / paidOrderCount : 0;
+
+  console.log("[orders] fetched:", orderCount, "orders |", paidOrderCount, "paid | revenue: \u00a3" + revenue.toFixed(2), "| AOV: \u00a3" + avgOrderValue.toFixed(2));
+
+  const shopifyStats = { orderCount, revenue, avgOrderValue, sampleSize: paidOrderCount, revenueIsEstimated: false };
+
+  const productMap = {};
+  for (const order of allPaidOrders) {
+    for (const item of (order.line_items || [])) {
+      const key = item.title || "Unknown";
+      if (!productMap[key]) productMap[key] = { title: key, revenue: 0, units: 0 };
+      productMap[key].revenue += parseFloat(item.price || 0) * (item.quantity || 1);
+      productMap[key].units += item.quantity || 1;
+    }
+  }
+  const allProducts = Object.values(productMap);
+  const topProducts = {
+    byRevenue: [...allProducts].sort((a, b) => b.revenue - a.revenue).slice(0, 3),
+    byUnits: [...allProducts].sort((a, b) => b.units - a.units).slice(0, 3),
+  };
+
+  const orderData = { shopifyStats, topProducts };
+  setCachedOrderData(shop, orderData);
+  return orderData;
 }
 
 async function fetchGoogleAnalyticsData() {
@@ -622,7 +688,7 @@ app.get("/auth/callback", async (req, res) => {
   }
 });
 
-// Dashboard — 4-tile insights view
+// Dashboard — 4-tile insights view (streams skeleton on cache miss)
 app.get("/dashboard", async (req, res) => {
   const shop = req.query.shop;
   const tokenData = shop ? getShopToken(shop) : null;
@@ -640,21 +706,61 @@ app.get("/dashboard", async (req, res) => {
     console.log("[dashboard] fetching data for shop:", shop);
     const shopData = await shopifyFetch(shop, accessToken, "shop");
     const storeName = shopData.shop.name;
-
-    // Check insights cache — render immediately (full content if cached, loading skeletons if not)
-    let insightsData = null;
     const forceRefresh = req.query.refresh === "1";
 
+    // Check insights cache
+    let insightsData = null;
     if (ANTHROPIC_API_KEY && !forceRefresh) {
       insightsData = getCachedInsights(shop);
       if (insightsData) {
-        console.log("[dashboard] using cached insights from", new Date(insightsData.generatedAt).toISOString());
+        console.log("[dashboard] cache hit from", new Date(insightsData.generatedAt).toISOString());
       }
     }
 
-    const isLoading = !!ANTHROPIC_API_KEY && !insightsData;
-    console.log("[dashboard] rendering — cached:", !!insightsData, "| loading:", isLoading);
-    res.send(buildDashboardHtml(storeName, shop, insightsData, isLoading, forceRefresh));
+    // Cache hit or no API key — render full page immediately
+    if (insightsData || !ANTHROPIC_API_KEY) {
+      console.log("[dashboard] rendering full page (cached:", !!insightsData, ")");
+      return res.send(buildDashboardHtml(storeName, shop, insightsData));
+    }
+
+    // Cache miss — stream skeleton page, then swap in real content when ready
+    console.log("[dashboard] cache miss — streaming skeleton + generating insights");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.flushHeaders();
+
+    // Phase 1: send skeleton page immediately (without </body></html>)
+    res.write(buildSkeletonHtml(storeName, shop));
+
+    // Phase 2: fetch data + generate insights
+    try {
+      const orderData = await getShopifyOrderData(shop, accessToken);
+
+      const [gaData, metaAdsData] = await Promise.all([
+        fetchGoogleAnalyticsData().catch(err => { console.log("[dashboard] GA failed:", err.message); return null; }),
+        fetchMetaAdsData().catch(err => { console.log("[dashboard] Meta failed:", err.message); return null; }),
+      ]);
+
+      const tiles = await generateTileInsights(orderData.shopifyStats, gaData, metaAdsData, orderData.topProducts);
+      const newInsights = { tiles, shopifyStats: orderData.shopifyStats, gaData, metaAdsData };
+      setCachedInsights(shop, newInsights);
+
+      // Phase 3: swap skeleton with real content via inline script
+      const cached = getCachedInsights(shop);
+      const contentHtml = buildContentHtml(cached, shop);
+      res.write("<script>(function(){var c=document.getElementById('dashboard-content');if(c)c.innerHTML=" + JSON.stringify(contentHtml) + ";if(window.__li)clearInterval(window.__li);})();</script>");
+      console.log("[dashboard] streamed real content");
+    } catch (genErr) {
+      console.error("[dashboard] generation error:", genErr.message);
+      if (genErr.message.includes("401")) {
+        deleteShopToken(shop);
+        res.write("<script>window.location.replace('/install?shop=" + encodeURIComponent(shop) + "&error=token_expired');</script>");
+      } else {
+        res.write("<script>(function(){if(window.__li)clearInterval(window.__li);var el=document.getElementById('loading-status');if(el)el.innerHTML='\\u26a0\\ufe0f Failed to generate insights. <a href=\"/dashboard?shop=" + encodeURIComponent(shop) + "&refresh=1\">Try again</a>';})();</script>");
+      }
+    }
+
+    res.write("</body></html>");
+    res.end();
   } catch (err) {
     console.error("Dashboard error:", err);
     if (err.message.includes("401")) {
@@ -662,100 +768,6 @@ app.get("/dashboard", async (req, res) => {
       return res.redirect(`/install?shop=${encodeURIComponent(shop)}&error=token_expired`);
     }
     res.status(500).send("Failed to load dashboard. Check server logs.");
-  }
-});
-
-// Dashboard data generation — called async from client-side loading script
-app.get("/dashboard/generate", async (req, res) => {
-  const shop = req.query.shop;
-  const tokenData = shop ? getShopToken(shop) : null;
-
-  if (!shop || !tokenData) {
-    return res.status(401).json({ error: "Not authenticated" });
-  }
-
-  if (!ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured" });
-  }
-
-  const forceRefresh = req.query.refresh === "1";
-
-  // Check cache first (unless force refresh)
-  if (!forceRefresh) {
-    const cached = getCachedInsights(shop);
-    if (cached) {
-      console.log("[generate] returning cached insights");
-      return res.json(cached);
-    }
-  }
-
-  try {
-    const { accessToken } = tokenData;
-    console.log("[generate] generating fresh insights for:", shop);
-
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    const sinceDate = thirtyDaysAgo.toISOString();
-
-    // Get exact order count + paginate ALL paid orders for accurate revenue/AOV
-    const countData = await shopifyFetch(
-      shop,
-      accessToken,
-      `orders/count?status=any&created_at_min=${encodeURIComponent(sinceDate)}`
-    );
-    const orderCount = countData.count || 0;
-
-    const allPaidOrders = await fetchAllPaidOrders(shop, accessToken, sinceDate);
-    const paidOrderCount = allPaidOrders.length;
-    const revenue = allPaidOrders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
-    const avgOrderValue = paidOrderCount > 0 ? revenue / paidOrderCount : 0;
-
-    console.log("[generate] orders:", orderCount, "| paid:", paidOrderCount, "| revenue: \u00a3" + revenue.toFixed(2), "| AOV: \u00a3" + avgOrderValue.toFixed(2));
-
-    const shopifyStats = { orderCount, revenue, avgOrderValue, sampleSize: paidOrderCount, revenueIsEstimated: false };
-
-    // Extract top products from all paid orders
-    const productMap = {};
-    for (const order of allPaidOrders) {
-      for (const item of (order.line_items || [])) {
-        const key = item.title || "Unknown";
-        if (!productMap[key]) productMap[key] = { title: key, revenue: 0, units: 0 };
-        productMap[key].revenue += parseFloat(item.price || 0) * (item.quantity || 1);
-        productMap[key].units += item.quantity || 1;
-      }
-    }
-    const allProducts = Object.values(productMap);
-    const topProducts = {
-      byRevenue: [...allProducts].sort((a, b) => b.revenue - a.revenue).slice(0, 3),
-      byUnits: [...allProducts].sort((a, b) => b.units - a.units).slice(0, 3),
-    };
-
-    let gaData = null;
-    try {
-      gaData = await fetchGoogleAnalyticsData();
-    } catch (gaErr) {
-      console.log("[generate] GA fetch failed (continuing without):", gaErr.message);
-    }
-
-    let metaAdsData = null;
-    try {
-      metaAdsData = await fetchMetaAdsData();
-    } catch (metaErr) {
-      console.log("[generate] Meta Ads fetch failed (continuing without):", metaErr.message);
-    }
-
-    const tiles = await generateTileInsights(shopifyStats, gaData, metaAdsData, topProducts);
-
-    const insightsData = { tiles, shopifyStats, gaData, metaAdsData };
-    setCachedInsights(shop, insightsData);
-
-    // Return the cached version (includes generatedAt timestamp)
-    const cached = getCachedInsights(shop);
-    console.log("[generate] insights generated and cached");
-    res.json(cached);
-  } catch (err) {
-    console.error("[generate] error:", err.message);
-    res.status(500).json({ error: err.message });
   }
 });
 
@@ -786,64 +798,21 @@ app.get("/insights", async (req, res) => {
   try {
     const { accessToken } = tokenData;
 
-    // Fetch last 30 days — exact count + sample for AOV
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    const sinceDate = thirtyDaysAgo.toISOString();
+    // Get order data (from 24hr cache or fresh pagination)
+    const orderData = await getShopifyOrderData(shop, accessToken);
+    console.log("[insights] shopify stats:", orderData.shopifyStats);
 
-    console.log("[insights] fetching Shopify order stats since:", sinceDate);
-    const countData = await shopifyFetch(
-      shop,
-      accessToken,
-      `orders/count?status=any&created_at_min=${encodeURIComponent(sinceDate)}`
-    );
-    const orderCount = countData.count || 0;
-
-    const allPaidOrders = await fetchAllPaidOrders(shop, accessToken, sinceDate);
-    const paidOrderCount = allPaidOrders.length;
-    const revenue = allPaidOrders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
-    const avgOrderValue = paidOrderCount > 0 ? revenue / paidOrderCount : 0;
-
-    const shopifyStats = { orderCount, revenue, avgOrderValue, sampleSize: paidOrderCount, revenueIsEstimated: false };
-    console.log("[insights] shopify stats:", shopifyStats);
-
-    // Extract top products from all paid orders
-    const productMap = {};
-    for (const order of allPaidOrders) {
-      for (const item of (order.line_items || [])) {
-        const key = item.title || "Unknown";
-        if (!productMap[key]) productMap[key] = { title: key, revenue: 0, units: 0 };
-        productMap[key].revenue += parseFloat(item.price || 0) * (item.quantity || 1);
-        productMap[key].units += item.quantity || 1;
-      }
-    }
-    const allProducts = Object.values(productMap);
-    const topProducts = {
-      byRevenue: [...allProducts].sort((a, b) => b.revenue - a.revenue).slice(0, 3),
-      byUnits: [...allProducts].sort((a, b) => b.units - a.units).slice(0, 3),
-    };
-
-    // Fetch GA data (may be null if not configured)
-    let gaData = null;
-    try {
-      gaData = await fetchGoogleAnalyticsData();
-    } catch (gaErr) {
-      console.log("[insights] GA fetch failed (continuing without):", gaErr.message);
-    }
-
-    // Fetch Meta Ads data (may be null if not configured)
-    let metaAdsData = null;
-    try {
-      metaAdsData = await fetchMetaAdsData();
-    } catch (metaErr) {
-      console.log("[insights] Meta Ads fetch failed (continuing without):", metaErr.message);
-    }
+    // Fetch GA + Meta in parallel
+    const [gaData, metaAdsData] = await Promise.all([
+      fetchGoogleAnalyticsData().catch(err => { console.log("[insights] GA failed:", err.message); return null; }),
+      fetchMetaAdsData().catch(err => { console.log("[insights] Meta failed:", err.message); return null; }),
+    ]);
 
     // Generate tile insights with Claude
-    const tiles = await generateTileInsights(shopifyStats, gaData, metaAdsData, topProducts);
+    const tiles = await generateTileInsights(orderData.shopifyStats, gaData, metaAdsData, orderData.topProducts);
 
     res.json({
-      shopifyStats,
+      shopifyStats: orderData.shopifyStats,
       gaData,
       metaAdsData,
       tiles,
@@ -907,7 +876,75 @@ function formatTileHtml(text) {
     .replace(/\n/g, "<br>");
 }
 
-function buildDashboardHtml(storeName, shop, insightsData, isLoading, forceRefresh) {
+// Shared CSS for dashboard pages
+function getDashboardStyles() {
+  return `
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f6f6f7; color: #1a1a1a; }
+    .topbar { background: #1a1a1a; color: #fff; padding: 16px 32px; display: flex; justify-content: space-between; align-items: center; }
+    .topbar h1 { font-size: 18px; font-weight: 600; }
+    .topbar nav { display: flex; gap: 20px; }
+    .topbar a { color: #b5b5b5; text-decoration: none; font-size: 14px; }
+    .topbar a:hover { color: #fff; }
+    .topbar a.active { color: #fff; }
+    .connected-bar { background: #008060; color: #fff; padding: 14px 32px; font-size: 15px; }
+    .connected-bar strong { font-weight: 600; }
+    .container { max-width: 960px; margin: 24px auto; padding: 0 24px; }
+    .refresh-flash { background: #dcfce7; color: #166534; padding: 12px 20px; border-radius: 10px; font-size: 14px; font-weight: 500; margin-bottom: 12px; text-align: center; animation: fadeOut 3s ease-in-out forwards; }
+    @keyframes fadeOut { 0%, 70% { opacity: 1; } 100% { opacity: 0; } }
+    .freshness-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 8px; }
+    .freshness-card { background: #fff; border-radius: 12px; padding: 16px; display: flex; gap: 12px; align-items: center; box-shadow: 0 1px 3px rgba(0,0,0,0.06); border: 1px solid #e5e7eb; }
+    .freshness-card-off { opacity: 0.5; }
+    .freshness-card-icon { font-size: 24px; }
+    .freshness-card-body { flex: 1; }
+    .freshness-card-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; margin-bottom: 2px; }
+    .freshness-card-metric { font-size: 16px; font-weight: 700; color: #1a1a1a; }
+    .freshness-card-metric.dim { font-weight: 400; color: #9ca3af; font-size: 13px; }
+    .freshness-card-sub { font-size: 12px; color: #6b7280; margin-top: 1px; }
+    .freshness-footer { font-size: 12px; color: #6b7280; text-align: center; padding: 8px 0 4px; margin-bottom: 16px; }
+    .refresh-link { color: #008060; text-decoration: none; font-weight: 500; cursor: pointer; }
+    .refresh-link:hover { text-decoration: underline; }
+    .refresh-link.loading { pointer-events: none; color: #6b7280; }
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    .refresh-link.loading .refresh-spin { display: inline-block; animation: spin 1s linear infinite; }
+    .tile-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .tile { border-radius: 14px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+    .tile.full { grid-column: 1 / -1; }
+    .tile-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; display: flex; align-items: center; gap: 6px; }
+    .tile-body { font-size: 15px; line-height: 1.7; color: #374151; }
+    .tile-body strong { color: #1a1a1a; font-weight: 600; }
+    .tile-healthy { background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%); border: 1px solid #bbf7d0; }
+    .tile-healthy .tile-label { color: #166534; }
+    .tile-warning { background: linear-gradient(135deg, #fefce8 0%, #fef9c3 100%); border: 1px solid #fde68a; }
+    .tile-warning .tile-label { color: #92400e; }
+    .tile-critical { background: linear-gradient(135deg, #fef2f2 0%, #fff1f2 100%); border: 1px solid #fecaca; }
+    .tile-critical .tile-label { color: #991b1b; }
+    .tile-action { background: linear-gradient(135deg, #eff6ff 0%, #f0f9ff 100%); border: 1px solid #bfdbfe; }
+    .tile-action .tile-label { color: #1e40af; }
+    .tile-opportunity { background: linear-gradient(135deg, #fefce8 0%, #fef9c3 100%); border: 1px solid #fde68a; }
+    .tile-opportunity .tile-label { color: #92400e; }
+    .insights-error { background: #fff; border-radius: 14px; padding: 40px; text-align: center; color: #6b7280; font-size: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+    .insights-error a { color: #008060; text-decoration: none; font-weight: 500; }
+    .setup-card { background: #fff; border-radius: 14px; padding: 48px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+    .setup-card h2 { font-size: 18px; margin-bottom: 8px; }
+    .setup-card p { color: #6b7280; font-size: 14px; line-height: 1.6; }
+    .tile-skeleton { background: #fff; border: 1px solid #e5e7eb; }
+    .skeleton-line { display: block; height: 14px; background: linear-gradient(90deg, #e5e7eb 25%, #f3f4f6 50%, #e5e7eb 75%); background-size: 200% 100%; border-radius: 4px; margin-bottom: 10px; animation: shimmer 1.5s ease-in-out infinite; }
+    .skeleton-label { width: 100px; height: 12px; background: linear-gradient(90deg, #e5e7eb 25%, #f3f4f6 50%, #e5e7eb 75%); background-size: 200% 100%; border-radius: 4px; animation: shimmer 1.5s ease-in-out infinite; }
+    @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+    .loading-status { text-align: center; padding: 20px 0 8px; font-size: 14px; color: #6b7280; font-weight: 500; margin-bottom: 16px; }
+    .loading-dot { display: inline-block; width: 8px; height: 8px; background: #008060; border-radius: 50%; margin-right: 8px; vertical-align: middle; animation: pulse 1.5s ease-in-out infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    @media (max-width: 640px) {
+      .tile-grid { grid-template-columns: 1fr; }
+      .tile.full { grid-column: 1; }
+      .freshness-cards { grid-template-columns: 1fr; }
+    }
+  `;
+}
+
+// Build just the content HTML (freshness cards + tile grid) — used by cache-hit and streaming paths
+function buildContentHtml(insightsData, shop) {
   const shopParam = encodeURIComponent(shop);
   const now = new Date();
   const thirtyDaysAgo = new Date(now);
@@ -916,139 +953,122 @@ function buildDashboardHtml(storeName, shop, insightsData, isLoading, forceRefre
   const dateTo = now.toLocaleDateString("en-GB", { month: "short", day: "numeric", year: "numeric" });
   const dateRange = `${dateFrom} - ${dateTo}`;
 
-  const justRefreshed = insightsData && insightsData.generatedAt && (Date.now() - insightsData.generatedAt < 5000);
+  const justRefreshed = insightsData.generatedAt && (Date.now() - insightsData.generatedAt < 5000);
+  const stats = insightsData.shopifyStats;
+  const ga = insightsData.gaData;
+  const meta = insightsData.metaAdsData;
+  const updatedAt = new Date(insightsData.generatedAt);
+  const timeStr = updatedAt.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+  const isToday = updatedAt.toDateString() === now.toDateString();
+  const updatedLabel = isToday ? `Today at ${timeStr}` : updatedAt.toLocaleDateString("en-GB", { month: "short", day: "numeric" }) + ` at ${timeStr}`;
 
-  // Data freshness cards
-  let freshnessHtml = "";
-  if (isLoading) {
-    freshnessHtml = `
-      <div class="freshness-cards">
-        <div class="freshness-card">
-          <div class="freshness-card-icon" style="opacity:0.3">\ud83d\uded2</div>
-          <div class="freshness-card-body">
-            <div class="skeleton-line" style="width:60px"></div>
-            <div class="skeleton-line" style="width:130px;margin:0"></div>
-          </div>
-        </div>
-        <div class="freshness-card">
-          <div class="freshness-card-icon" style="opacity:0.3">\ud83d\udcca</div>
-          <div class="freshness-card-body">
-            <div class="skeleton-line" style="width:70px"></div>
-            <div class="skeleton-line" style="width:110px;margin:0"></div>
-          </div>
-        </div>
-        <div class="freshness-card">
-          <div class="freshness-card-icon" style="opacity:0.3">\ud83d\udcf1</div>
-          <div class="freshness-card-body">
-            <div class="skeleton-line" style="width:65px"></div>
-            <div class="skeleton-line" style="width:95px;margin:0"></div>
-          </div>
-        </div>
-      </div>
-      <div class="loading-status" id="loading-status">
-        <span class="loading-dot"></span> Connecting to your store\u2026
-      </div>`;
-  } else if (insightsData) {
-    const stats = insightsData.shopifyStats;
-    const ga = insightsData.gaData;
-    const meta = insightsData.metaAdsData;
-    const updatedAt = new Date(insightsData.generatedAt);
-    const timeStr = updatedAt.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
-    const isToday = updatedAt.toDateString() === now.toDateString();
-    const updatedLabel = isToday ? `Today at ${timeStr}` : updatedAt.toLocaleDateString("en-GB", { month: "short", day: "numeric" }) + ` at ${timeStr}`;
+  const metaRoas = meta && meta.spend > 0 ? (meta.revenue / meta.spend).toFixed(2) : null;
+  const ordersPerDay = Math.round(stats.orderCount / 30);
+  const orderTrend = ordersPerDay > 100 ? "\ud83d\udcc8" : ordersPerDay < 50 ? "\ud83d\udcc9" : "\u27a1\ufe0f";
 
-    const metaRoas = meta && meta.spend > 0 ? (meta.revenue / meta.spend).toFixed(2) : null;
-
-    // Shopify: orders per day + trend
-    const ordersPerDay = Math.round(stats.orderCount / 30);
-    const orderTrend = ordersPerDay > 100 ? "\ud83d\udcc8" : ordersPerDay < 50 ? "\ud83d\udcc9" : "\u27a1\ufe0f";
-
-    // Analytics: bounce rate insight
-    let bounceInsight = "";
-    if (ga) {
-      const br = ga.bounceRate * 100;
-      if (br < 40) bounceInsight = "Great engagement \u2705";
-      else if (br <= 65) bounceInsight = "Bounce OK \u27a1\ufe0f";
-      else bounceInsight = "High bounce \u26a0\ufe0f";
-    }
-
-    freshnessHtml = `
-      ${justRefreshed ? '<div class="refresh-flash">\u2705 Insights refreshed</div>' : ""}
-      <div class="freshness-cards">
-        <div class="freshness-card">
-          <div class="freshness-card-icon">\ud83d\uded2</div>
-          <div class="freshness-card-body">
-            <div class="freshness-card-title">Shopify</div>
-            <div class="freshness-card-metric">${stats.orderCount.toLocaleString()} orders &middot; ${ordersPerDay}/day ${orderTrend}</div>
-            <div class="freshness-card-sub">${dateRange}</div>
-          </div>
-        </div>
-        <div class="freshness-card${ga ? "" : " freshness-card-off"}">
-          <div class="freshness-card-icon">\ud83d\udcca</div>
-          <div class="freshness-card-body">
-            <div class="freshness-card-title">Analytics</div>
-            ${ga
-              ? `<div class="freshness-card-metric">${ga.sessions.toLocaleString()} sessions</div>
-                 <div class="freshness-card-sub">${bounceInsight}</div>`
-              : `<div class="freshness-card-metric dim">Not connected</div>`
-            }
-          </div>
-        </div>
-        <div class="freshness-card${meta ? "" : " freshness-card-off"}">
-          <div class="freshness-card-icon">\ud83d\udcf1</div>
-          <div class="freshness-card-body">
-            <div class="freshness-card-title">Meta Ads</div>
-            ${meta
-              ? `<div class="freshness-card-metric">\u00a3${meta.spend.toFixed(0)} spend</div>
-                 <div class="freshness-card-sub">${metaRoas}x ROAS</div>`
-              : `<div class="freshness-card-metric dim">Not connected</div>`
-            }
-          </div>
-        </div>
-      </div>
-      <div class="freshness-footer">
-        Last updated: ${escapeHtml(updatedLabel)} &middot; <a href="/dashboard?shop=${shopParam}&refresh=1" class="refresh-link" id="refresh-btn" onclick="this.classList.add('loading');this.innerHTML='<span class=\\'refresh-spin\\'>\\ud83d\\udd04</span> Refreshing...';">\u2728 Refresh</a>
-      </div>`;
+  let bounceInsight = "";
+  if (ga) {
+    const br = ga.bounceRate * 100;
+    if (br < 40) bounceInsight = "Great engagement \u2705";
+    else if (br <= 65) bounceInsight = "Bounce OK \u27a1\ufe0f";
+    else bounceInsight = "High bounce \u26a0\ufe0f";
   }
 
-  // Get tiles and determine dynamic classes
-  const tiles = insightsData?.tiles;
+  let html = justRefreshed ? '<div class="refresh-flash">\u2705 Insights refreshed</div>' : "";
+  html += `
+    <div class="freshness-cards">
+      <div class="freshness-card">
+        <div class="freshness-card-icon">\ud83d\uded2</div>
+        <div class="freshness-card-body">
+          <div class="freshness-card-title">Shopify</div>
+          <div class="freshness-card-metric">${stats.orderCount.toLocaleString()} orders &middot; ${ordersPerDay}/day ${orderTrend}</div>
+          <div class="freshness-card-sub">${dateRange}</div>
+        </div>
+      </div>
+      <div class="freshness-card${ga ? "" : " freshness-card-off"}">
+        <div class="freshness-card-icon">\ud83d\udcca</div>
+        <div class="freshness-card-body">
+          <div class="freshness-card-title">Analytics</div>
+          ${ga
+            ? `<div class="freshness-card-metric">${ga.sessions.toLocaleString()} sessions</div>
+               <div class="freshness-card-sub">${bounceInsight}</div>`
+            : `<div class="freshness-card-metric dim">Not connected</div>`
+          }
+        </div>
+      </div>
+      <div class="freshness-card${meta ? "" : " freshness-card-off"}">
+        <div class="freshness-card-icon">\ud83d\udcf1</div>
+        <div class="freshness-card-body">
+          <div class="freshness-card-title">Meta Ads</div>
+          ${meta
+            ? `<div class="freshness-card-metric">\u00a3${meta.spend.toFixed(0)} spend</div>
+               <div class="freshness-card-sub">${metaRoas}x ROAS</div>`
+            : `<div class="freshness-card-metric dim">Not connected</div>`
+          }
+        </div>
+      </div>
+    </div>
+    <div class="freshness-footer">
+      Last updated: ${escapeHtml(updatedLabel)} &middot; <a href="/dashboard?shop=${shopParam}&refresh=1" class="refresh-link" id="refresh-btn" onclick="this.classList.add('loading');this.innerHTML='<span class=\\'refresh-spin\\'>\\ud83d\\udd04</span> Refreshing...';">\u2728 Refresh</a>
+    </div>`;
+
+  // Tiles
+  const tiles = insightsData.tiles;
   const hasTiles = tiles && (tiles.healthCheck || tiles.biggestIssue || tiles.quickWin || tiles.opportunity || tiles.adPerformance);
 
-  // Dynamic tile class based on severity
-  const healthClass = tiles ? ({
-    healthy: "tile-healthy",
-    warning: "tile-warning",
-    critical: "tile-critical",
-  }[tiles.healthSeverity] || "tile-healthy") : "tile-healthy";
+  if (!hasTiles) {
+    html += `<div class="insights-error">Unable to generate insights. <a href="/dashboard?shop=${shopParam}&refresh=1">Try again</a></div>`;
+    return html;
+  }
 
-  const adClass = tiles ? ({
-    healthy: "tile-healthy",
-    warning: "tile-warning",
-    critical: "tile-critical",
-  }[tiles.adSeverity] || "tile-healthy") : "tile-healthy";
+  const healthClass = ({ healthy: "tile-healthy", warning: "tile-warning", critical: "tile-critical" }[tiles.healthSeverity] || "tile-healthy");
+  const adClass = ({ healthy: "tile-healthy", warning: "tile-warning", critical: "tile-critical" }[tiles.adSeverity] || "tile-healthy");
 
-  // Extract status emoji from tile body text for inline display in label
   const statusEmojis = ["\ud83d\udfe2", "\ud83d\udfe1", "\ud83d\udd34"];
   let healthEmoji = "\ud83c\udfe5";
-  let healthBody = tiles?.healthCheck || "";
-  if (tiles) {
-    const match = statusEmojis.find(e => tiles.healthCheck.startsWith(e));
-    if (match) {
-      healthEmoji = match;
-      healthBody = tiles.healthCheck.slice(match.length).trim();
-    }
-  }
+  let healthBody = tiles.healthCheck || "";
+  const hMatch = statusEmojis.find(e => tiles.healthCheck.startsWith(e));
+  if (hMatch) { healthEmoji = hMatch; healthBody = tiles.healthCheck.slice(hMatch.length).trim(); }
+
   let adEmoji = "\ud83d\udcb0";
-  let adBody = tiles?.adPerformance || "";
-  if (tiles && tiles.adPerformance) {
-    const match = statusEmojis.find(e => tiles.adPerformance.startsWith(e));
-    if (match) {
-      adEmoji = match;
-      adBody = tiles.adPerformance.slice(match.length).trim();
-    }
+  let adBody = tiles.adPerformance || "";
+  if (tiles.adPerformance) {
+    const aMatch = statusEmojis.find(e => tiles.adPerformance.startsWith(e));
+    if (aMatch) { adEmoji = aMatch; adBody = tiles.adPerformance.slice(aMatch.length).trim(); }
   }
 
+  html += `
+    <div class="tile-grid">
+      <div class="tile ${healthClass} full">
+        <div class="tile-label">${healthEmoji} Health Check</div>
+        <div class="tile-body">${formatTileHtml(healthBody)}</div>
+      </div>
+      <div class="tile tile-critical">
+        <div class="tile-label">\ud83d\udea8 Biggest Issue</div>
+        <div class="tile-body">${formatTileHtml(tiles.biggestIssue)}</div>
+      </div>
+      <div class="tile tile-action">
+        <div class="tile-label">\u26a1 Quick Win</div>
+        <div class="tile-body">${formatTileHtml(tiles.quickWin)}</div>
+      </div>
+      <div class="tile tile-opportunity full">
+        <div class="tile-label">\ud83c\udf1f Opportunity</div>
+        <div class="tile-body">${formatTileHtml(tiles.opportunity)}</div>
+      </div>
+      ${tiles.adPerformance ? `
+      <div class="tile ${adClass} full">
+        <div class="tile-label">${adEmoji} Ad Performance</div>
+        <div class="tile-body">${formatTileHtml(adBody)}</div>
+      </div>
+      ` : ""}
+    </div>`;
+
+  return html;
+}
+
+// Streaming skeleton page — sent immediately on cache miss (without </body></html>)
+function buildSkeletonHtml(storeName, shop) {
+  const shopParam = encodeURIComponent(shop);
   return `
     <!DOCTYPE html>
     <html lang="en">
@@ -1064,84 +1084,7 @@ function buildDashboardHtml(storeName, shop, insightsData, isLoading, forceRefre
             || btoa(${JSON.stringify(shop + "/admin")}),
         };
       </script>
-      <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f6f6f7; color: #1a1a1a; }
-        .topbar { background: #1a1a1a; color: #fff; padding: 16px 32px; display: flex; justify-content: space-between; align-items: center; }
-        .topbar h1 { font-size: 18px; font-weight: 600; }
-        .topbar nav { display: flex; gap: 20px; }
-        .topbar a { color: #b5b5b5; text-decoration: none; font-size: 14px; }
-        .topbar a:hover { color: #fff; }
-        .topbar a.active { color: #fff; }
-        .connected-bar { background: #008060; color: #fff; padding: 14px 32px; font-size: 15px; }
-        .connected-bar strong { font-weight: 600; }
-        .container { max-width: 960px; margin: 24px auto; padding: 0 24px; }
-
-        /* Refresh flash */
-        .refresh-flash { background: #dcfce7; color: #166534; padding: 12px 20px; border-radius: 10px; font-size: 14px; font-weight: 500; margin-bottom: 12px; text-align: center; animation: fadeOut 3s ease-in-out forwards; }
-        @keyframes fadeOut { 0%, 70% { opacity: 1; } 100% { opacity: 0; } }
-
-        /* Freshness cards */
-        .freshness-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 8px; }
-        .freshness-card { background: #fff; border-radius: 12px; padding: 16px; display: flex; gap: 12px; align-items: center; box-shadow: 0 1px 3px rgba(0,0,0,0.06); border: 1px solid #e5e7eb; }
-        .freshness-card-off { opacity: 0.5; }
-        .freshness-card-icon { font-size: 24px; }
-        .freshness-card-body { flex: 1; }
-        .freshness-card-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #6b7280; margin-bottom: 2px; }
-        .freshness-card-metric { font-size: 16px; font-weight: 700; color: #1a1a1a; }
-        .freshness-card-metric.dim { font-weight: 400; color: #9ca3af; font-size: 13px; }
-        .freshness-card-sub { font-size: 12px; color: #6b7280; margin-top: 1px; }
-        .freshness-footer { font-size: 12px; color: #6b7280; text-align: center; padding: 8px 0 4px; margin-bottom: 16px; }
-        .refresh-link { color: #008060; text-decoration: none; font-weight: 500; cursor: pointer; }
-        .refresh-link:hover { text-decoration: underline; }
-        .refresh-link.loading { pointer-events: none; color: #6b7280; }
-        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-        .refresh-link.loading .refresh-spin { display: inline-block; animation: spin 1s linear infinite; }
-
-        /* Tile grid */
-        .tile-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-        .tile { border-radius: 14px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-        .tile.full { grid-column: 1 / -1; }
-        .tile-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; display: flex; align-items: center; gap: 6px; }
-        .tile-body { font-size: 15px; line-height: 1.7; color: #374151; }
-        .tile-body strong { color: #1a1a1a; font-weight: 600; }
-
-        /* Dynamic tile colors */
-        .tile-healthy { background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%); border: 1px solid #bbf7d0; }
-        .tile-healthy .tile-label { color: #166534; }
-        .tile-warning { background: linear-gradient(135deg, #fefce8 0%, #fef9c3 100%); border: 1px solid #fde68a; }
-        .tile-warning .tile-label { color: #92400e; }
-        .tile-critical { background: linear-gradient(135deg, #fef2f2 0%, #fff1f2 100%); border: 1px solid #fecaca; }
-        .tile-critical .tile-label { color: #991b1b; }
-        .tile-action { background: linear-gradient(135deg, #eff6ff 0%, #f0f9ff 100%); border: 1px solid #bfdbfe; }
-        .tile-action .tile-label { color: #1e40af; }
-        .tile-opportunity { background: linear-gradient(135deg, #fefce8 0%, #fef9c3 100%); border: 1px solid #fde68a; }
-        .tile-opportunity .tile-label { color: #92400e; }
-
-        /* Error state */
-        .insights-error { background: #fff; border-radius: 14px; padding: 40px; text-align: center; color: #6b7280; font-size: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-        .insights-error a { color: #008060; text-decoration: none; font-weight: 500; }
-
-        /* No API key state */
-        .setup-card { background: #fff; border-radius: 14px; padding: 48px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-        .setup-card h2 { font-size: 18px; margin-bottom: 8px; }
-        .setup-card p { color: #6b7280; font-size: 14px; line-height: 1.6; }
-
-        /* Skeleton loading */
-        .tile-skeleton { background: #fff; border: 1px solid #e5e7eb; }
-        .skeleton-line { display: block; height: 14px; background: linear-gradient(90deg, #e5e7eb 25%, #f3f4f6 50%, #e5e7eb 75%); background-size: 200% 100%; border-radius: 4px; margin-bottom: 10px; animation: shimmer 1.5s ease-in-out infinite; }
-        .skeleton-label { width: 100px; height: 12px; background: linear-gradient(90deg, #e5e7eb 25%, #f3f4f6 50%, #e5e7eb 75%); background-size: 200% 100%; border-radius: 4px; animation: shimmer 1.5s ease-in-out infinite; }
-        @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
-        .loading-status { text-align: center; padding: 20px 0 8px; font-size: 14px; color: #6b7280; font-weight: 500; margin-bottom: 16px; }
-        .loading-dot { display: inline-block; width: 8px; height: 8px; background: #008060; border-radius: 50%; margin-right: 8px; vertical-align: middle; animation: pulse 1.5s ease-in-out infinite; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-
-        @media (max-width: 640px) {
-          .tile-grid { grid-template-columns: 1fr; }
-          .tile.full { grid-column: 1; }
-          .freshness-cards { grid-template-columns: 1fr; }
-        }
-      </style>
+      <style>${getDashboardStyles()}</style>
     </head>
     <body>
       <div class="topbar">
@@ -1152,11 +1095,33 @@ function buildDashboardHtml(storeName, shop, insightsData, isLoading, forceRefre
         </nav>
       </div>
       <div class="connected-bar">Connected to: <strong>${escapeHtml(storeName)}</strong> (${escapeHtml(shop)})</div>
-      <div class="container">
-
-        ${freshnessHtml}
-
-        ${isLoading ? `
+      <div class="container" id="dashboard-content">
+        <div class="freshness-cards">
+          <div class="freshness-card">
+            <div class="freshness-card-icon" style="opacity:0.3">\ud83d\uded2</div>
+            <div class="freshness-card-body">
+              <div class="skeleton-line" style="width:60px"></div>
+              <div class="skeleton-line" style="width:130px;margin:0"></div>
+            </div>
+          </div>
+          <div class="freshness-card">
+            <div class="freshness-card-icon" style="opacity:0.3">\ud83d\udcca</div>
+            <div class="freshness-card-body">
+              <div class="skeleton-line" style="width:70px"></div>
+              <div class="skeleton-line" style="width:110px;margin:0"></div>
+            </div>
+          </div>
+          <div class="freshness-card">
+            <div class="freshness-card-icon" style="opacity:0.3">\ud83d\udcf1</div>
+            <div class="freshness-card-body">
+              <div class="skeleton-line" style="width:65px"></div>
+              <div class="skeleton-line" style="width:95px;margin:0"></div>
+            </div>
+          </div>
+        </div>
+        <div class="loading-status" id="loading-status">
+          <span class="loading-dot"></span> Connecting to your store\u2026
+        </div>
         <div class="tile-grid">
           <div class="tile tile-skeleton full">
             <div class="tile-label"><span class="skeleton-label"></span></div>
@@ -1188,85 +1153,68 @@ function buildDashboardHtml(storeName, shop, insightsData, isLoading, forceRefre
             </div>
           </div>
         </div>
-        ` : !ANTHROPIC_API_KEY ? `
-        <div class="setup-card">
-          <h2>Add your Anthropic API key to get started</h2>
-          <p>Set ANTHROPIC_API_KEY in your environment variables to enable AI-powered store insights.</p>
-        </div>
-        ` : !hasTiles ? `
-        <div class="insights-error">
-          Unable to generate insights. <a href="/dashboard?shop=${shopParam}&refresh=1">Try again</a>
-        </div>
-        ` : `
-        <div class="tile-grid">
-
-          <div class="tile ${healthClass} full">
-            <div class="tile-label">${healthEmoji} Health Check</div>
-            <div class="tile-body">${formatTileHtml(healthBody)}</div>
-          </div>
-
-          <div class="tile tile-critical">
-            <div class="tile-label">\ud83d\udea8 Biggest Issue</div>
-            <div class="tile-body">${formatTileHtml(tiles.biggestIssue)}</div>
-          </div>
-
-          <div class="tile tile-action">
-            <div class="tile-label">\u26a1 Quick Win</div>
-            <div class="tile-body">${formatTileHtml(tiles.quickWin)}</div>
-          </div>
-
-          <div class="tile tile-opportunity full">
-            <div class="tile-label">\ud83c\udf1f Opportunity</div>
-            <div class="tile-body">${formatTileHtml(tiles.opportunity)}</div>
-          </div>
-
-          ${tiles.adPerformance ? `
-          <div class="tile ${adClass} full">
-            <div class="tile-label">${adEmoji} Ad Performance</div>
-            <div class="tile-body">${formatTileHtml(adBody)}</div>
-          </div>
-          ` : ""}
-
-        </div>
-        `}
-
       </div>
-      ${isLoading ? `
       <script>
-      (function() {
-        var shop = ${JSON.stringify(shop)};
-        var isRefresh = ${forceRefresh ? "true" : "false"};
-        var el = document.getElementById("loading-status");
-        var msgs = [
-          "Connecting to your store\\u2026",
-          "Fetching order data\\u2026",
-          "Pulling analytics\\u2026",
-          "Generating AI insights\\u2026",
-          "Almost ready\\u2026"
-        ];
-        var i = 0;
-        var t = setInterval(function() {
-          i = Math.min(i + 1, msgs.length - 1);
-          if (el) el.innerHTML = '<span class="loading-dot"></span> ' + msgs[i];
+        window.__li = setInterval(function() {
+          var el = document.getElementById("loading-status");
+          var msgs = ["Connecting to your store\\u2026","Fetching order data\\u2026","Pulling analytics\\u2026","Generating AI insights\\u2026","Almost ready\\u2026"];
+          if (!window.__mi) window.__mi = 0;
+          window.__mi = Math.min(window.__mi + 1, msgs.length - 1);
+          if (el) el.innerHTML = '<span class="loading-dot"></span> ' + msgs[window.__mi];
         }, 3000);
-
-        fetch("/dashboard/generate?shop=" + encodeURIComponent(shop) + (isRefresh ? "&refresh=1" : ""), { credentials: "include" })
-          .then(function(r) { return r.json(); })
-          .then(function(data) {
-            clearInterval(t);
-            if (data.error) {
-              if (el) el.innerHTML = "\\u26a0\\ufe0f Failed to generate insights. <a href=\\"/dashboard?shop=" + encodeURIComponent(shop) + "&refresh=1\\">Try again</a>";
-              return;
-            }
-            window.location.replace("/dashboard?shop=" + encodeURIComponent(shop));
-          })
-          .catch(function() {
-            clearInterval(t);
-            if (el) el.innerHTML = "\\u26a0\\ufe0f Something went wrong. <a href=\\"/dashboard?shop=" + encodeURIComponent(shop) + "&refresh=1\\">Try again</a>";
-          });
-      })();
       </script>
-      ` : ""}
+  `;
+}
+
+// Full dashboard page for cache-hit rendering
+function buildDashboardHtml(storeName, shop, insightsData) {
+  const shopParam = encodeURIComponent(shop);
+
+  let contentHtml;
+  if (insightsData) {
+    contentHtml = buildContentHtml(insightsData, shop);
+  } else if (!ANTHROPIC_API_KEY) {
+    contentHtml = `
+      <div class="setup-card">
+        <h2>Add your Anthropic API key to get started</h2>
+        <p>Set ANTHROPIC_API_KEY in your environment variables to enable AI-powered store insights.</p>
+      </div>`;
+  } else {
+    contentHtml = `
+      <div class="insights-error">
+        Unable to generate insights. <a href="/dashboard?shop=${shopParam}&refresh=1">Try again</a>
+      </div>`;
+  }
+
+  return `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Dashboard \u2014 ${escapeHtml(storeName)}</title>
+      <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
+      <script>
+        shopify.config = {
+          apiKey: ${JSON.stringify(SHOPIFY_API_KEY)},
+          host: new URLSearchParams(window.location.search).get("host")
+            || btoa(${JSON.stringify(shop + "/admin")}),
+        };
+      </script>
+      <style>${getDashboardStyles()}</style>
+    </head>
+    <body>
+      <div class="topbar">
+        <h1>Shopify Dashboard</h1>
+        <nav>
+          <a href="/dashboard?shop=${shopParam}" class="active">Dashboard</a>
+          <a href="/settings?shop=${shopParam}">Settings</a>
+        </nav>
+      </div>
+      <div class="connected-bar">Connected to: <strong>${escapeHtml(storeName)}</strong> (${escapeHtml(shop)})</div>
+      <div class="container">
+        ${contentHtml}
+      </div>
     </body>
     </html>
   `;
