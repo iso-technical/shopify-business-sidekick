@@ -59,6 +59,11 @@ function getDashboardStyles() {
     .loading-status { text-align: center; padding: 20px 0 8px; font-size: 14px; color: #6b7280; font-weight: 500; margin-bottom: 16px; }
     .loading-dot { display: inline-block; width: 8px; height: 8px; background: #008060; border-radius: 50%; margin-right: 8px; vertical-align: middle; animation: pulse 1.5s ease-in-out infinite; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    .auto-refresh-banner { max-width: 960px; margin: 12px auto 0; padding: 10px 20px; border-radius: 10px; font-size: 14px; font-weight: 500; text-align: center; transition: opacity 0.3s ease; }
+    .auto-refresh-banner a { color: inherit; font-weight: 600; text-decoration: underline; }
+    .arb-loading { background: #dbeafe; color: #1e40af; }
+    .arb-success { background: #dcfce7; color: #166534; }
+    .arb-error { background: #fef3c7; color: #92400e; }
     @media (max-width: 640px) {
       .tile-grid { grid-template-columns: 1fr; }
       .tile.full { grid-column: 1; }
@@ -295,6 +300,48 @@ function buildSkeletonHtml(storeName, shop) {
 function buildDashboardHtml(storeName, shop, insightsData) {
   const shopParam = encodeURIComponent(shop);
 
+  // Auto-refresh: if cached data is from before today, refresh in background
+  let autoRefreshScript = "";
+  if (insightsData) {
+    autoRefreshScript = `
+      <script>
+      (function() {
+        var ts = ${insightsData.generatedAt};
+        var today = new Date(); today.setHours(0,0,0,0);
+        if (ts >= today.getTime()) return;
+        var b = document.getElementById('auto-refresh-banner');
+        b.className = 'auto-refresh-banner arb-loading';
+        b.innerHTML = '<span class="loading-dot"></span> \ud83d\udcca Updating to today\u2019s data\u2026';
+        b.style.display = '';
+        fetch('/dashboard/refresh?shop=${shopParam}')
+          .then(function(r) {
+            if (r.status === 401) { window.location.replace('/install?shop=${shopParam}&error=token_expired'); throw new Error('auth'); }
+            if (!r.ok) throw new Error(r.status);
+            return r.json();
+          })
+          .then(function(d) {
+            var c = document.getElementById('dashboard-content');
+            if (c) c.innerHTML = d.html;
+            var f = c && c.querySelector('.refresh-flash'); if (f) f.remove();
+            b.className = 'auto-refresh-banner arb-success';
+            b.textContent = '\u2705 Dashboard updated';
+            setTimeout(function() { b.style.opacity = '0'; setTimeout(function() { b.style.display = 'none'; }, 300); }, 3000);
+          })
+          .catch(function(e) {
+            if (e.message === 'auth') return;
+            b.className = 'auto-refresh-banner arb-error';
+            b.textContent = '';
+            b.appendChild(document.createTextNode('\u26a0\ufe0f Couldn\u2019t refresh automatically. '));
+            var a = document.createElement('a');
+            a.href = '/dashboard?shop=${shopParam}&refresh=1';
+            a.className = 'refresh-link';
+            a.textContent = 'Tap Refresh to retry.';
+            b.appendChild(a);
+          });
+      })();
+      </script>`;
+  }
+
   let contentHtml;
   if (insightsData) {
     contentHtml = buildContentHtml(insightsData, shop);
@@ -337,9 +384,11 @@ function buildDashboardHtml(storeName, shop, insightsData) {
         </nav>
       </div>
       <div class="connected-bar">Connected to: <strong>${escapeHtml(storeName)}</strong> (${escapeHtml(shop)})</div>
-      <div class="container">
+      <div id="auto-refresh-banner" style="display:none"></div>
+      <div class="container" id="dashboard-content">
         ${contentHtml}
       </div>
+      ${autoRefreshScript}
     </body>
     </html>
   `;

@@ -9,6 +9,46 @@ const { fetchMetaAdsData } = require("../lib/meta");
 const { generateTileInsights } = require("../lib/insights");
 const { buildDashboardHtml, buildSkeletonHtml, buildContentHtml } = require("../views/dashboard");
 
+// JSON endpoint for client-side auto-refresh (stale data from previous day)
+router.get("/dashboard/refresh", async (req, res) => {
+  const shop = req.query.shop;
+  const tokenData = shop ? getShopToken(shop) : null;
+
+  if (!shop || !tokenData) {
+    return res.status(401).json({ error: "Not authenticated" });
+  }
+
+  const { accessToken } = tokenData;
+
+  try {
+    clearInsightsCache(shop);
+    clearOrderDataCache(shop);
+
+    const [shopData, orderData, gaData, metaAdsData] = await Promise.all([
+      shopifyFetch(shop, accessToken, "shop"),
+      getShopifyOrderData(shop, accessToken),
+      fetchGoogleAnalyticsData().catch(err => { logger.info("[auto-refresh] GA failed:", err.message); return null; }),
+      fetchMetaAdsData().catch(err => { logger.info("[auto-refresh] Meta failed:", err.message); return null; }),
+    ]);
+
+    const tiles = await generateTileInsights(orderData.shopifyStats, gaData, metaAdsData, orderData.topProducts);
+    setCachedInsights(shop, { tiles, shopifyStats: orderData.shopifyStats, gaData, metaAdsData });
+
+    const cached = getCachedInsights(shop);
+    const contentHtml = buildContentHtml(cached, shop);
+
+    logger.info("[auto-refresh] completed for", shop);
+    res.json({ html: contentHtml, storeName: shopData.shop.name });
+  } catch (err) {
+    logger.error("[auto-refresh] error:", err.message);
+    if (err.message.includes("401")) {
+      deleteShopToken(shop);
+      return res.status(401).json({ error: "token_expired" });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get("/dashboard", async (req, res) => {
   const shop = req.query.shop;
   const tokenData = shop ? getShopToken(shop) : null;
