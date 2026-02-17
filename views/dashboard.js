@@ -72,6 +72,107 @@ function getDashboardStyles() {
   `;
 }
 
+function getSkeletonContentHtml(loadingMessage) {
+  return `
+    <div class="freshness-cards">
+      <div class="freshness-card">
+        <div class="freshness-card-icon" style="opacity:0.3">\ud83d\uded2</div>
+        <div class="freshness-card-body">
+          <div class="skeleton-line" style="width:60px"></div>
+          <div class="skeleton-line" style="width:130px;margin:0"></div>
+        </div>
+      </div>
+      <div class="freshness-card">
+        <div class="freshness-card-icon" style="opacity:0.3">\ud83d\udcca</div>
+        <div class="freshness-card-body">
+          <div class="skeleton-line" style="width:70px"></div>
+          <div class="skeleton-line" style="width:110px;margin:0"></div>
+        </div>
+      </div>
+      <div class="freshness-card">
+        <div class="freshness-card-icon" style="opacity:0.3">\ud83d\udcf1</div>
+        <div class="freshness-card-body">
+          <div class="skeleton-line" style="width:65px"></div>
+          <div class="skeleton-line" style="width:95px;margin:0"></div>
+        </div>
+      </div>
+    </div>
+    <div class="loading-status" id="loading-status">
+      <span class="loading-dot"></span> ${loadingMessage}
+    </div>
+    <div class="tile-grid">
+      <div class="tile tile-skeleton full">
+        <div class="tile-label"><span class="skeleton-label"></span></div>
+        <div class="tile-body">
+          <span class="skeleton-line" style="width:92%"></span>
+          <span class="skeleton-line" style="width:75%"></span>
+          <span class="skeleton-line" style="width:55%"></span>
+        </div>
+      </div>
+      <div class="tile tile-skeleton">
+        <div class="tile-label"><span class="skeleton-label"></span></div>
+        <div class="tile-body">
+          <span class="skeleton-line" style="width:88%"></span>
+          <span class="skeleton-line" style="width:65%"></span>
+        </div>
+      </div>
+      <div class="tile tile-skeleton">
+        <div class="tile-label"><span class="skeleton-label"></span></div>
+        <div class="tile-body">
+          <span class="skeleton-line" style="width:82%"></span>
+          <span class="skeleton-line" style="width:60%"></span>
+        </div>
+      </div>
+      <div class="tile tile-skeleton full">
+        <div class="tile-label"><span class="skeleton-label"></span></div>
+        <div class="tile-body">
+          <span class="skeleton-line" style="width:90%"></span>
+          <span class="skeleton-line" style="width:70%"></span>
+        </div>
+      </div>
+    </div>`;
+}
+
+function getRefreshScript(shopParam) {
+  const skeletonHtml = getSkeletonContentHtml("Refreshing insights\u2026");
+  return `
+    <script>
+    function doRefresh(sp) {
+      var c = document.getElementById('dashboard-content');
+      if (!c) return;
+      c.innerHTML = ${JSON.stringify(skeletonHtml)};
+      var mi = 0;
+      var msgs = ['Refreshing insights\\u2026','Fetching order data\\u2026','Generating AI insights\\u2026','Almost ready\\u2026'];
+      var li = setInterval(function() {
+        mi = Math.min(mi + 1, msgs.length - 1);
+        var el = document.getElementById('loading-status');
+        if (el) el.innerHTML = '<span class="loading-dot"></span> ' + msgs[mi];
+      }, 3000);
+      fetch('/dashboard/refresh?shop=' + sp)
+        .then(function(r) {
+          clearInterval(li);
+          if (r.status === 401) { window.location.replace('/install?shop=' + sp + '&error=token_expired'); throw new Error('auth'); }
+          if (!r.ok) throw new Error(r.status);
+          return r.json();
+        })
+        .then(function(d) {
+          c.innerHTML = d.html;
+          if (d.storeName) {
+            document.title = 'Dashboard \\u2014 ' + d.storeName;
+            var b = document.querySelector('.connected-bar');
+            if (b) b.innerHTML = 'Connected to: <strong>' + d.storeName + '</strong>';
+          }
+        })
+        .catch(function(e) {
+          clearInterval(li);
+          if (e.message === 'auth') return;
+          var el = document.getElementById('loading-status');
+          if (el) el.innerHTML = '\\u26a0\\ufe0f Failed to refresh. <a href="javascript:void(0)" onclick="doRefresh(\\'' + sp + '\\')">Try again</a>';
+        });
+    }
+    </script>`;
+}
+
 function buildContentHtml(insightsData, shop) {
   const shopParam = encodeURIComponent(shop);
   const now = new Date();
@@ -137,7 +238,7 @@ function buildContentHtml(insightsData, shop) {
       </div>
     </div>
     <div class="freshness-footer">
-      Last updated: ${escapeHtml(updatedLabel)} &middot; <a href="/dashboard?shop=${shopParam}&refresh=1" class="refresh-link" id="refresh-btn" onclick="this.classList.add('loading');this.textContent='Refreshing\\u2026';">\u2728 Refresh</a>
+      Last updated: ${escapeHtml(updatedLabel)} &middot; <a href="/dashboard?shop=${shopParam}&refresh=1" class="refresh-link" id="refresh-btn" onclick="event.preventDefault();doRefresh('${shopParam}');">\u2728 Refresh</a>
     </div>`;
 
   const tiles = insightsData.tiles;
@@ -222,64 +323,9 @@ function buildSkeletonHtml(storeName, shop) {
       </div>
       <div class="connected-bar">Connected to: <strong>${escapeHtml(storeName)}</strong> (${escapeHtml(shop)})</div>
       <div class="container" id="dashboard-content">
-        <div class="freshness-cards">
-          <div class="freshness-card">
-            <div class="freshness-card-icon" style="opacity:0.3">\ud83d\uded2</div>
-            <div class="freshness-card-body">
-              <div class="skeleton-line" style="width:60px"></div>
-              <div class="skeleton-line" style="width:130px;margin:0"></div>
-            </div>
-          </div>
-          <div class="freshness-card">
-            <div class="freshness-card-icon" style="opacity:0.3">\ud83d\udcca</div>
-            <div class="freshness-card-body">
-              <div class="skeleton-line" style="width:70px"></div>
-              <div class="skeleton-line" style="width:110px;margin:0"></div>
-            </div>
-          </div>
-          <div class="freshness-card">
-            <div class="freshness-card-icon" style="opacity:0.3">\ud83d\udcf1</div>
-            <div class="freshness-card-body">
-              <div class="skeleton-line" style="width:65px"></div>
-              <div class="skeleton-line" style="width:95px;margin:0"></div>
-            </div>
-          </div>
-        </div>
-        <div class="loading-status" id="loading-status">
-          <span class="loading-dot"></span> Connecting to your store\u2026
-        </div>
-        <div class="tile-grid">
-          <div class="tile tile-skeleton full">
-            <div class="tile-label"><span class="skeleton-label"></span></div>
-            <div class="tile-body">
-              <span class="skeleton-line" style="width:92%"></span>
-              <span class="skeleton-line" style="width:75%"></span>
-              <span class="skeleton-line" style="width:55%"></span>
-            </div>
-          </div>
-          <div class="tile tile-skeleton">
-            <div class="tile-label"><span class="skeleton-label"></span></div>
-            <div class="tile-body">
-              <span class="skeleton-line" style="width:88%"></span>
-              <span class="skeleton-line" style="width:65%"></span>
-            </div>
-          </div>
-          <div class="tile tile-skeleton">
-            <div class="tile-label"><span class="skeleton-label"></span></div>
-            <div class="tile-body">
-              <span class="skeleton-line" style="width:82%"></span>
-              <span class="skeleton-line" style="width:60%"></span>
-            </div>
-          </div>
-          <div class="tile tile-skeleton full">
-            <div class="tile-label"><span class="skeleton-label"></span></div>
-            <div class="tile-body">
-              <span class="skeleton-line" style="width:90%"></span>
-              <span class="skeleton-line" style="width:70%"></span>
-            </div>
-          </div>
-        </div>
+        ${getSkeletonContentHtml("Connecting to your store\u2026")}
       </div>
+      ${getRefreshScript(shopParam)}
       <script>
         window.__li = setInterval(function() {
           var el = document.getElementById("loading-status");
@@ -388,6 +434,7 @@ function buildDashboardHtml(storeName, shop, insightsData) {
       <div class="container" id="dashboard-content">
         ${contentHtml}
       </div>
+      ${getRefreshScript(shopParam)}
       ${autoRefreshScript}
     </body>
     </html>
